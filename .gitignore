@@ -1,0 +1,6 @@
+# client inventory (names, server addresses, notes) — kept local, never in the repo
+clients.json
+archive/
+# local scratch
+tmp_dbg/
+*.tar.gz

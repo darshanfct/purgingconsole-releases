@@ -1,0 +1,14 @@
+[Unit]
+Description=Purging Management Console realtime watcher
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/purgingconsole --watch
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target
