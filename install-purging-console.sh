@@ -29,7 +29,7 @@ set -u
 # SECTION: Constants & Global State
 # ============================================================
 readonly APP_NAME="Purging Management Console"
-readonly APP_VERSION="2.6.6"
+readonly APP_VERSION="2.6.7"
 readonly CONFIG_SCHEMA_VERSION=2
 readonly CONF_DIR="/etc/darshan/purging"
 readonly PATHS_DIR="${CONF_DIR}/paths.d"
@@ -596,18 +596,16 @@ storage_overview() {
 collect_stats() {
   STAT_TOTAL=0; STAT_ENABLED=0; STAT_DISABLED=0; STAT_LAST_RUN=0
   STAT_TOTAL_FREED=0; STAT_INVALID=0
-  local f
+  local f en lp lf
   for f in $(list_confs); do
     STAT_TOTAL=$(( STAT_TOTAL + 1 ))
     if ! ( load_conf "$f" ) >/dev/null 2>&1; then STAT_INVALID=$(( STAT_INVALID + 1 )); continue; fi
-    (
-      load_conf "$f" >/dev/null 2>&1 || exit 0
-      echo "$ENABLED $LAST_PURGE $LAST_FREED"
-    ) | { read -r en lp lf
-          [ "$en" = "1" ] && STAT_ENABLED=$(( STAT_ENABLED + 1 )) || STAT_DISABLED=$(( STAT_DISABLED + 1 ))
-          [ "${lp:-0}" -gt "$STAT_LAST_RUN" ] && STAT_LAST_RUN=$lp
-          STAT_TOTAL_FREED=$(( STAT_TOTAL_FREED + ${lf:-0} ))
-        }
+    # read in this shell (not at the end of a pipe, whose subshell threw the counts away)
+    en=""; lp=""; lf=""
+    read -r en lp lf < <(load_conf "$f" >/dev/null 2>&1 && echo "$ENABLED ${LAST_PURGE:-0} ${LAST_FREED:-0}")
+    [ "$en" = "1" ] && STAT_ENABLED=$(( STAT_ENABLED + 1 )) || STAT_DISABLED=$(( STAT_DISABLED + 1 ))
+    [ "${lp:-0}" -gt "$STAT_LAST_RUN" ] && STAT_LAST_RUN=$lp
+    STAT_TOTAL_FREED=$(( STAT_TOTAL_FREED + ${lf:-0} ))
   done
 }
 
@@ -1346,8 +1344,13 @@ det_proc_users() {
            fi)
 }
 
-# det_rsyslog_inputs — "pattern|on|off" per imfile input (on = reopenOnTruncate="on")
+# det_rsyslog_inputs — "pattern|on|off" per imfile input (on = reopenOnTruncate="on").
+# Inside a purge pass this comes from the 60 s cache (det_cache_refresh): it is asked for every file.
 det_rsyslog_inputs() {
+  if [ -n "${DET_FL_AT:-}" ]; then [ -n "$DET_RS_IN" ] && printf '%s\n' "$DET_RS_IN"; return 0; fi
+  det_rsyslog_inputs_raw
+}
+det_rsyslog_inputs_raw() {
   local f blk pat re rsf
   mapfile -t rsf < <(list_glob DET_RSYSLOG_FILES)
   for f in ${rsf[@]+"${rsf[@]}"}; do [ -r "$f" ] && grep -vE '^[[:space:]]*#' "$f"; done 2>/dev/null | tr '\n' ' ' \
@@ -1363,7 +1366,7 @@ det_rsyslog_inputs() {
 }
 
 # det_rsyslog_patterns — imfile file patterns, one per line
-det_rsyslog_patterns() { det_rsyslog_inputs | cut -d'|' -f1; }
+det_rsyslog_patterns() { local p r; while IFS='|' read -r p r; do [ -n "$p" ] && printf '%s\n' "$p"; done < <(det_rsyslog_inputs); return 0; }
 
 # det_fluentd_expand <conf> [depth] — the file plus everything it pulls in with @include (globs, relative paths)
 det_fluentd_expand() {
@@ -1383,17 +1386,19 @@ det_fluentd_expand() {
 # Backup / disabled copies (*.bak, *.new, *.orig, *-old.conf, *.disabled) are ignored unless a running
 # process was started with one.
 det_fluentd_confs() {
-  local p cmd a prev c
+  local p a prev c
+  local -a argv
   {
     for p in /proc/[0-9]*; do
-      cmd=$( { tr '\0' '\n' < "$p/cmdline"; } 2>/dev/null) || continue
-      case "$cmd" in *fluentd*|*td-agent*) ;; *) continue;; esac
+      # read the command line with a builtin: one fork per process here cost hundreds of forks per scan
+      mapfile -d '' -t argv < "$p/cmdline" 2>/dev/null || continue
+      case "${argv[*]-}" in *fluentd*|*td-agent*) ;; *) continue;; esac
       prev=""
-      while IFS= read -r a; do
+      for a in "${argv[@]}"; do
         case "$prev" in -c|--config) echo "$a";; esac
         case "$a" in --config=*) echo "${a#--config=}";; -c=*) echo "${a#-c=}";; esac
         prev="$a"
-      done <<<"$cmd"
+      done
       { tr '\0' '\n' < "$p/environ"; } 2>/dev/null | sed -n 's/^FLUENT_CONF=//p'
     done
     local skip sk
@@ -1433,7 +1438,8 @@ det_fluentd_buffers_raw() {
 # (not inside a pipeline), so the cache survives for the rest of the pass.
 det_cache_refresh() {
   if [ -z "${DET_FL_AT:-}" ] || [ $(( SECONDS - DET_FL_AT )) -ge 60 ]; then
-    DET_FL_SRC=$(det_fluentd_sources_raw); DET_FL_BUF=$(det_fluentd_buffers_raw); DET_FL_AT=$SECONDS
+    DET_FL_SRC=$(det_fluentd_sources_raw); DET_FL_BUF=$(det_fluentd_buffers_raw); DET_RS_IN=$(det_rsyslog_inputs_raw)
+    DET_FL_AT=$SECONDS
   fi
 }
 det_fluentd_sources() {
@@ -1445,7 +1451,10 @@ det_fluentd_sources() {
 # fluentd position files and buffer chunks (not yet delivered), rsyslog queue files, systemd journal,
 # anything under a protected system/data directory. Echoes the reason.
 pg_protected_file() {
-  local f="$1" b bp pos pf
+  local f="$1" b bp pos pf bufs
+  # cached buffer list inside a pass. An empty list is a valid answer (no fluentd on this server) — it
+  # must not trigger a fresh scan of every process for each file (that cost a full CPU on a busy log receiver).
+  if [ -n "${DET_FL_AT:-}" ]; then bufs=$DET_FL_BUF; else bufs=$(det_fluentd_buffers_raw); fi
   for b in "${BLOCKED_PATHS[@]}"; do
     [ "$b" = "/" ] && continue
     if [[ "$f" == "$b/"* ]]; then echo "inside protected directory $b"; return 0; fi
@@ -1458,7 +1467,7 @@ pg_protected_file() {
     [ -n "$bp" ] || continue
     bp="${bp%%\**}"; bp="${bp%/}"
     if [ -n "$bp" ] && { [ "$f" = "$bp" ] || [[ "$f" == "$bp"* ]]; }; then echo "a fluentd buffer (logs not yet delivered)"; return 0; fi
-  done <<<"${DET_FL_BUF:-$(det_fluentd_buffers_raw)}"
+  done <<<"$bufs"
   while IFS='|' read -r pos pf; do
     [ -n "$pf" ] && [ "$f" = "$pf" ] && { echo "a fluentd position file"; return 0; }
   done < <(det_fluentd_sources)
@@ -2455,7 +2464,21 @@ purge_one_path() {
   fi
   [ "$force" = "force" ] && due=1
 
+  # Our rotated copies are visited oldest first (by the time in their name), after the other files.
+  # Below the disk limit the order does not matter. At the limit a held copy is released only while the
+  # disk is still at the limit (re-checked per copy), so this order frees the oldest hours and keeps the
+  # newest ones in one unbroken run — folder order released random hours and left gaps.
+  local -a pg_files=() pg_copies=()
   while IFS= read -r -d '' file; do
+    if [[ "${file##*/}" =~ \.purge-([0-9]+)$ ]]; then pg_copies+=("${BASH_REMATCH[1]}"$'\t'"$file")
+    else pg_files+=("$file"); fi
+  done < <(find "$TARGET_PATH" -type f \( -name "$PATTERN" -o -name "${PATTERN}.purge-*" \) -print0 2>/dev/null)
+  if [ "${#pg_copies[@]}" -gt 0 ]; then
+    while IFS= read -r -d '' file; do pg_files+=("${file#*$'\t'}"); done \
+      < <(printf '%s\0' "${pg_copies[@]}" | sort -z -n -t $'\t' -k1,1)
+  fi
+
+  for file in ${pg_files[@]+"${pg_files[@]}"}; do
     [ -L "$file" ] && { log_warn "skip (symlink): $file"; continue; }
     if ! pg_old_name "${file##*/}"; then
       # several names for one live file (hard links) must be processed once, not once per name
@@ -2473,7 +2496,7 @@ purge_one_path() {
     [ "$PG_OUTCOME" = "acted" ] && acted=$(( acted + 1 ))
     [ "$PG_LIVE" = "acted" ]   && live_acted=1
     [ "$PG_LIVE" = "pending" ] && live_pending=1
-  done < <(find "$TARGET_PATH" -type f \( -name "$PATTERN" -o -name "${PATTERN}.purge-*" \) -print0 2>/dev/null)
+  done
 
   if [ "$dry" = "1" ]; then
     [ "$acted" -gt 0 ] && [ -z "$verbose" ] && printf "  %b %s  ${C_DIM}->${C_RESET} would process %s files, %s freed\n" \
