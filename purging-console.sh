@@ -26,7 +26,7 @@ set -u
 # SECTION: Constants & Global State
 # ============================================================
 readonly APP_NAME="Purging Management Console"
-readonly APP_VERSION="2.6.9"
+readonly APP_VERSION="2.6.10"
 readonly CONFIG_SCHEMA_VERSION=2
 readonly CONF_DIR="/etc/darshan/purging"
 readonly PATHS_DIR="${CONF_DIR}/paths.d"
@@ -56,9 +56,12 @@ readonly PG_PROTECT_FLOOR=( "/" "/etc" "/usr" "/bin" "/sbin" "/lib" "/lib64" "/b
 
 # KEY <tab> type <tab> default <tab> group <tab> label      (list values: items separated by |)
 # types: dur (30s/15m/2h/1d)  pct  bool  size (64MB/1GB)  hhmm (23:55)  path  list:path  list:name  list:regex
+#        dirname (a folder name, or off)  copyname (copy-name format: {name} {ext} + date codes)
 SETTINGS_REGISTRY=$(cat <<'REG'
 PG_GRACE_SEC	dur	86400	Rotation	Hold each rotated copy this long, then delete it (paths can override)
 PG_DISK_EMERGENCY_PCT	pct	90	Rotation	Disk use at which a fully-read copy may go before its hold ends
+PG_COPY_DIR	dirname	purged	Rotation	Folder (inside the log's own folder) that holds the rotated copies; off = keep them beside the log
+PG_COPY_NAME	copyname	{name}_delete-at_%d-%b-%Y_at_%I-%M-%S-%p-%Z{ext}	Rotation	Name of a rotated copy: {name} {ext} and date codes (%d %b %Y %I %M %S %p %Z) for its delete time
 PG_ALLOW_TRUNCATE	bool	0	Rotation	Allow emptying a file in place when it cannot be rotated (paths can override)
 PG_ALLOW_BEHIND	bool	1	Rotation	Rotate while readers are still behind (they drain the old copy)
 PG_MAX_BEHIND	size	67108864	Rotation	Never rotate while a reader is more than this far behind
@@ -67,6 +70,7 @@ PG_ASIDE_KEEP_SEC	dur	86400	Rotation	Keep the safety copy made before an in-plac
 PG_ASIDE_MARGIN	size	1073741824	Rotation	Make that safety copy only if this much disk stays free
 PG_CATCHUP_SEC	dur	20	Timing	Wait up to this long for readers to reach the end
 PG_VERIFY_SEC	dur	15	Timing	Wait up to this long for writers to reopen after a rotation
+PG_RECENT_WRITE_SEC	dur	60	Timing	A file nobody holds open but written this recently may have a writer about to reopen it
 PG_RETRY_SEC	dur	60	Timing	Retry a file that had to be skipped after
 PG_PASS_SEC	dur	5	Timing	Background service: purge pass every
 PG_TICK_SEC	dur	1	Timing	Background service: check readers of rotated copies every
@@ -124,6 +128,19 @@ settings_normalize() {
           printf '%02d%02d\n' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[2]}))";;
     path) [[ "$raw" = /* ]] || { echo "use an absolute path"; return 1; }
           [[ "$raw" == *[\"$'\n\r']* ]] && { echo "the path contains a quote or a line break"; return 1; }
+          echo "$raw";;
+    dirname)
+          case "${raw,,}" in off|none|no) echo off; return 0;; esac
+          [[ "$raw" =~ ^[A-Za-z0-9._-]+$ ]] && [ "$raw" != "." ] && [ "$raw" != ".." ] \
+            || { echo "use a plain folder name like purged (letters, digits . _ -), or off"; return 1; }
+          echo "$raw";;
+    copyname)
+          [[ "$raw" == *[\"$'\n\r\t']* ]] && { echo "the name contains a quote, tab or line break"; return 1; }
+          [[ "$raw" == *"{name}"* ]] || { echo "the name must contain {name} (the log's own name), e.g. {name}_delete-at_%d-%b-%Y{ext}"; return 1; }
+          [[ "$raw" == */* ]] && { echo "the name cannot contain /"; return 1; }
+          v=$(LC_ALL=C date -d @0 +"$raw" 2>/dev/null) || { echo "the date codes in it are not valid"; return 1; }
+          [[ "$v" == */* ]] && { echo "a date code in it produces a / (e.g. %D or %x) — use %d-%m-%y instead"; return 1; }
+          [[ "$v" =~ \.purge-[0-9]+$ ]] && { echo "the name cannot end in .purge-<digits>"; return 1; }
           echo "$raw";;
     list:*)
       local -a _items=()
@@ -1516,6 +1533,72 @@ det_rsyslog_inputs_raw() {
 # det_rsyslog_patterns — imfile file patterns, one per line
 det_rsyslog_patterns() { local p r; while IFS='|' read -r p r; do [ -n "$p" ] && printf '%s\n' "$p"; done < <(det_rsyslog_inputs); return 0; }
 
+# det_rsyslog_outputs_raw — the files rsyslog WRITES, one per line (a glob where the name comes from a template):
+#   action(type="omfile" file="/var/log/x.log" …)          -> /var/log/x.log
+#   action(type="omfile" dynaFile="T" …) + template T       -> its string, each %property% as *
+#   legacy lines:  *.info  -/var/log/messages   |   :programname, isequal, "x"  /var/log/x.log   |   *.* ?T
+# rsyslog closes every one of these files on a HUP and opens it again only at its next write, so between
+# bursts (a disk queue writes every minute or two) no process holds them. This list says who writes them then.
+det_rsyslog_outputs_raw() {
+  local f all blk t s line
+  local -a rsf=()
+  declare -A tpl=()
+  mapfile -t rsf < <(list_glob DET_RSYSLOG_FILES)
+  all=$(for f in ${rsf[@]+"${rsf[@]}"}; do [ -r "$f" ] && grep -vE '^[[:space:]]*#' "$f"; done 2>/dev/null)
+  [ -n "$all" ] || return 0
+  # templates: template(name="T" type="string" string="…")  and  $template T,"…"
+  while IFS= read -r blk; do
+    t=$(sed -nE 's/.*(^|[^A-Za-z.])[Nn][Aa][Mm][Ee][[:space:]]*=[[:space:]]*"([^"]+)".*/\2/p' <<<"$blk")
+    s=$(sed -nE 's/.*(^|[^A-Za-z.])[Ss][Tt][Rr][Ii][Nn][Gg][[:space:]]*=[[:space:]]*"([^"]+)".*/\2/p' <<<"$blk")
+    [ -n "$t" ] && [ -n "$s" ] && tpl[$t]=$s
+  done < <(tr '\n' ' ' <<<"$all" | grep -oiE 'template[[:space:]]*\([^)]*\)')
+  while IFS= read -r line; do
+    [[ "$line" =~ ^[[:space:]]*\$template[[:space:]]+([^,[:space:]]+)[[:space:]]*,[[:space:]]*\"([^\"]+)\" ]] && tpl[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
+  done <<<"$all"
+  # omfile actions (spread over several lines)
+  while IFS= read -r blk; do
+    # the file= parameter itself — not fileOwner=, queue.filename= or any other name containing "file"
+    s=$(sed -nE 's/.*(^|[^A-Za-z.])[Ff][Ii][Ll][Ee][[:space:]]*=[[:space:]]*"([^"]+)".*/\2/p' <<<"$blk")
+    if [ -z "$s" ]; then
+      t=$(sed -nE 's/.*(^|[^A-Za-z.])[Dd][Yy][Nn][Aa][Ff][Ii][Ll][Ee][[:space:]]*=[[:space:]]*"([^"]+)".*/\2/p' <<<"$blk")
+      [ -n "$t" ] && s=${tpl[$t]:-}
+    fi
+    [[ "$s" == /* ]] && sed -E 's/%[^%]*%/*/g' <<<"$s"
+  done < <(tr '\n' ' ' <<<"$all" | grep -oiE 'action[[:space:]]*\([^)]*type[[:space:]]*=[[:space:]]*"omfile"[^)]*\)')
+  # legacy selector / filter lines: the last word is the file (-/path, /path) or a dynamic-file template (?T).
+  # Directives ($WorkDirectory /var/spool/rsyslog) and anything with ( … ) are not output lines.
+  while IFS= read -r s; do
+    case "$s" in
+      /*) printf '%s\n' "$s";;
+      \?*) t=${s#\?}; [[ "${tpl[$t]:-}" == /* ]] && sed -E 's/%[^%]*%/*/g' <<<"${tpl[$t]}";;
+    esac
+  done < <(awk '$0 !~ /^[ \t]*\$/ && $0 !~ /[()]/ && NF >= 2 { w=$NF; sub(/;.*/, "", w); sub(/^-\//, "/", w); if (w ~ /^\// || w ~ /^\?[A-Za-z0-9_.-]+$/) print w }' <<<"$all")
+  return 0
+}
+
+# det_rsyslog_running — "1" if an rsyslogd process is running
+det_rsyslog_running() {
+  if command -v pgrep >/dev/null 2>&1; then pgrep -x rsyslogd >/dev/null 2>&1 && echo 1 || echo 0; return 0; fi
+  local c n; for c in /proc/[0-9]*/comm; do read -r n < "$c" 2>/dev/null && [ "$n" = rsyslogd ] && { echo 1; return 0; }; done; echo 0
+}
+
+# det_rsyslog_writes <file> — 0 if a running rsyslog writes this file according to its config.
+# A template name (glob) does not count for a date-named file: /var/log/fw-%$day%.log names today's file AND
+# every older day's, and only today's is still written.
+det_rsyslog_writes() {
+  local f="$1" p outs run
+  if [ -n "${DET_FL_AT:-}" ]; then outs=$DET_RS_OUT; run=$DET_RS_RUN; else outs=$(det_rsyslog_outputs_raw); run=$(det_rsyslog_running); fi
+  [ "$run" = 1 ] && [ -n "$outs" ] || return 1
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    if [[ "$p" == *[*?]* ]]; then
+      pg_dated_name "${f##*/}" && continue
+      det_glob_match "$f" "$p" && return 0
+    elif [ "$f" = "$p" ]; then return 0; fi
+  done <<<"$outs"
+  return 1
+}
+
 # det_fluentd_expand <conf> [depth] — the file plus everything it pulls in with @include (globs, relative paths)
 det_fluentd_expand() {
   local c="$1" d="${2:-0}" inc base m
@@ -1605,6 +1688,7 @@ det_fluentd_buffers_raw() {
 det_cache_refresh() {
   if [ -z "${DET_FL_AT:-}" ] || [ $(( SECONDS - DET_FL_AT )) -ge 60 ]; then
     DET_FL_SRC=$(det_fluentd_sources_raw); DET_FL_BUF=$(det_fluentd_buffers_raw); DET_RS_IN=$(det_rsyslog_inputs_raw)
+    DET_RS_OUT=$(det_rsyslog_outputs_raw); DET_RS_RUN=$(det_rsyslog_running)
     DET_FL_AT=$SECONDS
   fi
 }
@@ -1996,8 +2080,9 @@ do_watch() {
 #                                                                 reloaded, or a reader that is down/unknown)
 # A live file is rotated only when every reader is at its end, or — if some are behind — only when
 # all of them hold it open (so they drain the renamed copy) and the watch & replay layer below covers
-# a reader that crashes before finishing. Our rotated copies (<file>.purge-<epoch>) are deleted only
-# after the grace period, once no process holds them and their watch record is closed.
+# a reader that crashes before finishing. Our rotated copies (in the copy folder, named with their delete
+# time — see "Copy folder" below; older ones <file>.purge-<epoch>) are deleted only at their delete time,
+# once no process holds them and their watch record is closed.
 PG_ROTATED_RE='(\.(gz|xz|bz2|zst|old|sum)|\.[0-9]+|\.purge-[0-9]+|-[0-9]{8})$'
 # Date-named files: a writer that names its files by date (20261029.log.jsonl, app.log.2026-10-29,
 # firewall_20261029_091630.log, Wazuh's archives/2026/Oct/ossec-archive-29.json) has moved on to a new
@@ -2034,7 +2119,9 @@ PG_ASIDE_DIR="/var/lib/purging-console/aside"
 declare -A PG_SKIP_SEEN=() PG_NEXT_TRY=()
 PG_WHY=""; PG_FREED=0; PG_OUTCOME="idle"; PG_LIVE=""
 PG_UNREAD=0; PG_UNREAD_STORED=0; PG_BLOCK=""; PG_STALE=0; PG_LAG=0
-PG_WRITERS=0; PG_ALL_APPEND=1; PG_UNRELOADABLE=0; PG_RELOAD_CMDS=()
+PG_WRITERS=0; PG_ALL_APPEND=1; PG_UNRELOADABLE=0; PG_RELOAD_CMDS=(); PG_WRITER_CONF=""
+PG_COPY_DUE=""; PG_COPY_REC=""; PG_DEST=""; PG_DEST_DIR=""
+DET_RS_OUT=""; DET_RS_RUN=0
 
 # pg_skip <file> <why> — remember the reason, log it once per distinct reason, back off retries
 pg_skip() {
@@ -2200,11 +2287,14 @@ pg_reload_cmd_for() {
   echo "systemctl reload $unit"
 }
 
-# pg_writers_check <file> — sets PG_WRITERS, PG_ALL_APPEND, PG_UNRELOADABLE, PG_RELOAD_CMDS
+# pg_writers_check <file> — sets PG_WRITERS, PG_ALL_APPEND, PG_UNRELOADABLE, PG_RELOAD_CMDS, PG_WRITER_CONF.
+# A file that no process holds open but that a running rsyslog writes by its config counts as written by
+# rsyslog (PG_WRITER_CONF=rsyslog): rsyslog opens it by name at its next write, so it is rotated like any
+# rsyslog file. Deciding "nobody writes it" between two bursts left busy firewall logs unrotated for a day.
 pg_writers_check() {
   local pid comm k rw app pos cmd
   declare -A seen=() cmdseen=()
-  PG_WRITERS=0; PG_ALL_APPEND=1; PG_UNRELOADABLE=0; PG_RELOAD_CMDS=()
+  PG_WRITERS=0; PG_ALL_APPEND=1; PG_UNRELOADABLE=0; PG_RELOAD_CMDS=(); PG_WRITER_CONF=""
   while IFS='|' read -r pid comm k rw app pos; do
     [ -n "$pid" ] && [ "$rw" != "r" ] || continue
     [ -n "${seen[$pid]:-}" ] && continue; seen[$pid]=1
@@ -2216,6 +2306,10 @@ pg_writers_check() {
       PG_UNRELOADABLE=1
     fi
   done < <(det_proc_users "$1")
+  if [ "$PG_WRITERS" -eq 0 ] && det_rsyslog_writes "$1"; then
+    PG_WRITERS=1; PG_WRITER_CONF=rsyslog; PG_RELOAD_CMDS=("$(pg_reload_cmd_for 0 rsyslog)")
+  fi
+  return 0
 }
 
 # pg_wait_caught_up <file> — 0 once every reader is at EOF; 1 on timeout / blocked
@@ -2263,6 +2357,7 @@ pg_readers_drain() {
 # A copy is never deleted while its watch record is open, nor while any process holds it open.
 PG_WATCH_DIR="/var/lib/purging-console/watch"
 PG_PENDING_DIR="/var/lib/purging-console/pending"   # per path: live files deferred and retried every pass
+PG_COPIES_DIR="/var/lib/purging-console/copies"     # one record per rotated copy in a copy folder: its delete time
 
 # pg_pid_start <pid> — process start time (field 22 of /proc/<pid>/stat); tells a restarted pid apart
 pg_pid_start() {
@@ -2410,6 +2505,194 @@ pg_watch_all() {
   return 0
 }
 
+# ============================================================
+# SECTION: Copy folder (where rotated copies are kept, and what they are named)
+# ============================================================
+# A rotated copy goes into a folder inside the log's own folder (setting PG_COPY_DIR, default "purged") and is
+# named after the log and the time it will be deleted (setting PG_COPY_NAME), e.g.
+#   /var/log/fw/purged/fw-01_delete-at_22-Nov-2026_at_03-29-37-PM-IST.log
+# Its delete time is kept in a record (PG_COPIES_DIR, keyed by device+inode, which a rename keeps), so the name
+# stays true even if the hold setting changes later. Without a record (records removed by hand) it is the
+# copy's last-write time plus the hold. The folder is same-disk only (a move there must be a rename), must be
+# a real folder owned by root (never a link), and is made again when it is missing. When it cannot be used the
+# copy is kept beside the log as <file>.purge-<epoch>, so rotation goes on. Copies named <file>.purge-<epoch>
+# (made by older versions, or with PG_COPY_DIR off) are still handled as before.
+
+# pg_in_copy_dir <file> — 0 if the file sits directly in a copy folder (a real, root-owned folder) BELOW the
+# path being processed. The configured folder itself is never a copy folder, even if it happens to be called
+# "purged": its files are live logs.
+pg_in_copy_dir() {
+  [ "$PG_COPY_DIR" != off ] || return 1
+  local d="${1%/*}" t="${TARGET_PATH:-}"
+  t="${t%/}"
+  [ -n "$t" ] && [[ "$d" == "$t/"* ]] || return 1
+  [ "${d##*/}" = "$PG_COPY_DIR" ] && [ -d "$d" ] && [ ! -L "$d" ] && [ -O "$d" ]
+}
+
+# pg_copy_info <file> <hold-sec> — 0 if the file is one of our rotated copies; sets PG_COPY_DUE (delete time,
+# epoch) and PG_COPY_REC (its record, "" if none)
+# [<"dev ino mtime"> — already known (from find -printf): saves a stat per file in big folders]
+pg_copy_info() {
+  local f="$1" hold="$2" dev="" ino="" mt="" rec k v c="" due=""
+  PG_COPY_DUE=""; PG_COPY_REC=""
+  if [[ "${f##*/}" =~ \.purge-([0-9]+)$ ]]; then PG_COPY_DUE=$(( BASH_REMATCH[1] + hold )); return 0; fi
+  if [ -n "${3:-}" ]; then read -r dev ino mt <<<"$3"; else read -r dev ino mt <<<"$(stat -c '%d %i %Y' -- "$f" 2>/dev/null)"; fi
+  mt=${mt%.*}
+  [ -n "$mt" ] || return 1
+  rec="$PG_COPIES_DIR/$dev-$ino.copy"
+  if [ -f "$rec" ]; then
+    while IFS='=' read -r k v; do case "$k" in COPY) c=$v;; DELETE_AT) due=$v;; esac; done < "$rec"
+    if [ "$c" = "$f" ] && [[ "$due" =~ ^[0-9]+$ ]]; then PG_COPY_DUE=$due; PG_COPY_REC=$rec; return 0; fi
+  fi
+  if pg_in_copy_dir "$f"; then PG_COPY_DUE=$(( mt + hold )); return 0; fi
+  return 1
+}
+
+# pg_copy_dir_ready <folder> <live file> — 0 if copies of that file can go into the folder (made if missing).
+# Sets PG_WHY when not.
+pg_copy_dir_ready() {
+  local d="$1" f="$2" p="${2%/*}" fd dd
+  if [ -L "$d" ]; then PG_WHY="$d is a link, not a folder (a link could lead outside the log folder)"; return 1; fi
+  if [ -e "$d" ] && [ ! -d "$d" ]; then PG_WHY="$d is a file, not a folder"; return 1; fi
+  if [ ! -d "$d" ]; then
+    if ! mkdir -m 0750 -- "$d" 2>/dev/null; then
+      { [ -d "$d" ] && [ ! -L "$d" ]; } || { PG_WHY="could not create the folder $d"; return 1; }
+    fi
+    chgrp --reference="$p" -- "$d" 2>/dev/null
+    if [ -d "$PG_COPIES_DIR" ] && grep -qsF -- "COPY=$d/" "$PG_COPIES_DIR"/*.copy 2>/dev/null; then
+      log_warn "copy folder $d was missing (removed by hand?) — created it again"
+    else
+      log_info "created copy folder $d"
+    fi
+  fi
+  [ -O "$d" ] || { PG_WHY="$d is not owned by root"; return 1; }
+  read -r dd fd <<<"$(stat -c %d -- "$d" "$f" 2>/dev/null | tr '\n' ' ')"
+  [ -n "$fd" ] && [ "$dd" = "$fd" ] || { PG_WHY="$d is on another disk (a move there would copy the file, not rename it)"; return 1; }
+  return 0
+}
+
+# pg_copy_dest <live file> <delete-at epoch> — sets PG_DEST (where the copy goes) and PG_DEST_DIR (its copy
+# folder; "" = kept beside the log under the old <file>.purge-<epoch> name)
+pg_copy_dest() {
+  local f="$1" due="$2" d base name ext nm
+  PG_DEST="${f}.purge-$(date +%s)"; PG_DEST_DIR=""
+  [ "$PG_COPY_DIR" != off ] || return 0
+  case "$f" in *$'\n'*) return 0;; esac
+  d="${f%/*}/$PG_COPY_DIR"
+  if ! pg_copy_dir_ready "$d" "$f"; then
+    if [ "${PG_SKIP_SEEN[copydir:$d]:-}" != "$PG_WHY" ]; then
+      PG_SKIP_SEEN["copydir:$d"]="$PG_WHY"
+      log_warn "copy folder not used: $PG_WHY — copies of logs in ${f%/*} are kept beside them (<file>.purge-<time>) until it is fixed"
+    fi
+    return 0
+  fi
+  PG_SKIP_SEEN["copydir:$d"]=""
+  base="${f##*/}"
+  if [[ "$base" == ?*.* ]]; then ext=".${base##*.}"; name="${base%.*}"; else ext=""; name="$base"; fi
+  nm=$(LC_ALL=C date -d "@$due" +"$PG_COPY_NAME" 2>/dev/null)
+  nm=${nm//\{name\}/"$name"}; nm=${nm//\{ext\}/"$ext"}
+  if [ -z "$nm" ] || [[ "$nm" == */* ]] || [ "${#nm}" -gt 250 ] || [ "$nm" = . ] || [ "$nm" = .. ] || [[ "$nm" =~ \.purge-[0-9]+$ ]]; then
+    if [ "${PG_SKIP_SEEN[copyname:$f]:-}" != 1 ]; then
+      PG_SKIP_SEEN["copyname:$f"]=1; log_warn "the copy name from PG_COPY_NAME cannot be used for $base (empty, too long or contains /) — kept as <file>.purge-<time>"
+    fi
+    return 0
+  fi
+  PG_DEST="$d/$nm"; PG_DEST_DIR="$d"
+}
+
+# pg_copy_record <copy> <live> <delete-at> <dev-ino of the live file> — written BEFORE the move (like the watch
+# record), so a crash between the move and the bookkeeping never leaves a copy without its delete time
+pg_copy_record() {
+  local rec="$PG_COPIES_DIR/$4.copy" tmp
+  mkdir -p "$PG_COPIES_DIR" 2>/dev/null && chmod 700 "$PG_COPIES_DIR" 2>/dev/null || return 1
+  tmp="$rec.tmp.$$"
+  printf 'COPY=%s\nLIVE=%s\nPATH=%s\nDELETE_AT=%s\n' "$1" "$2" "${TARGET_PATH:-}/${PATTERN:-}" "$3" > "$tmp" && mv -f "$tmp" "$rec"
+}
+
+# pg_move_copy <live> <dest> — the rename. If the copy folder was removed at this very moment, make it again
+# and try once more; on failure the live file is untouched.
+pg_move_copy() {
+  # checked again right before the move: removed meanwhile -> made again; turned into a link or a file -> refused
+  if [ -n "$PG_DEST_DIR" ] && { [ -L "$PG_DEST_DIR" ] || [ ! -d "$PG_DEST_DIR" ]; }; then
+    pg_copy_dir_ready "$PG_DEST_DIR" "$1" && [ ! -e "$2" ] || return 1
+  fi
+  mv -T -- "$1" "$2" 2>/dev/null && return 0
+  # removed in the instant between that check and the move: once more
+  [ -n "$PG_DEST_DIR" ] && [ ! -e "$PG_DEST_DIR" ] || return 1
+  pg_copy_dir_ready "$PG_DEST_DIR" "$1" && [ ! -e "$2" ] && mv -T -- "$1" "$2" 2>/dev/null
+}
+
+# pg_copies_sweep — forget copies that were removed outside this tool (logged once, when noticed)
+pg_copies_sweep() {
+  local rec k v c d
+  declare -A gone=()
+  [ -d "$PG_COPIES_DIR" ] || return 0
+  for rec in "$PG_COPIES_DIR"/*.copy; do
+    [ -f "$rec" ] || continue
+    c=""; while IFS='=' read -r k v; do [ "$k" = COPY ] && c=$v; done < "$rec"
+    if [ -z "$c" ] || [ ! -e "$c" ]; then
+      if [ -n "$c" ]; then
+        d="${c%/*}"
+        if [ -e "$d" ]; then log_warn "copy $c is gone — removed outside this tool (by hand?); forgotten"
+        else gone[$d]=$(( ${gone[$d]:-0} + 1 )); fi
+      fi
+      rm -f "$rec"
+    fi
+  done
+  for d in "${!gone[@]}"; do
+    log_warn "copy folder $d was removed outside this tool (by hand?) with ${gone[$d]} copies in it — forgotten; it is made again at the next rotation"
+  done
+  return 0
+}
+
+# pg_when <epoch> — a delete time for messages, in the server's time zone (22 Nov 2026 03:29:37 PM IST)
+pg_when() { LC_ALL=C date -d "@$1" '+%d %b %Y %I:%M:%S %p %Z' 2>/dev/null; }
+
+# pg_path_files <target> <pattern> <hold-sec> — NUL-separated: the path's files (live, finished, date-named),
+# then its rotated copies, oldest delete time first. Copy folders are not searched for live files.
+# One find per folder and no command per file (a big folder such as /opt holds many thousands of files).
+pg_path_files() {
+  local t="$1" p="$2" hold="$3" full="$1/$2" file d k v pth dev ino mt r
+  local -a files=() copies=() prune=()
+  declare -A recs=()
+  for r in "$PG_COPIES_DIR"/*.copy; do [ -f "$r" ] && { r=${r##*/}; recs[${r%.copy}]=1; }; done
+  [ "$PG_COPY_DIR" != off ] && prune=( -mindepth 1 \( -type d -name "$PG_COPY_DIR" -prune \) -o )
+  while IFS=$'\t' read -r -d '' dev ino mt file; do
+    [ -n "$file" ] || continue
+    # only an old .purge-<epoch> name or a file with a copy record can be a copy here (copy folders are pruned)
+    if { [[ "$file" == *.purge-* ]] || [ -n "${recs[$dev-$ino]:-}" ]; } && pg_copy_info "$file" "$hold" "$dev $ino $mt"; then
+      copies+=("$PG_COPY_DUE"$'\t'"$file")
+    else
+      files+=("$file")
+    fi
+  done < <(find "$t" ${prune[@]+"${prune[@]}"} -type f \( -name "$p" -o -name "${p}.purge-*" \) -printf '%D\t%i\t%T@\t%p\0' 2>/dev/null)
+  if [ "$PG_COPY_DIR" != off ]; then
+    declare -A others=()
+    while IFS= read -r r; do [ -n "$r" ] && [ "$r" != "$full" ] && others[$r]=1; done < <(awk '
+      FNR == 1 && NR > 1 { print t "/" p }
+      /^TARGET_PATH=/ { t = substr($0, 13); gsub(/"/, "", t) }
+      /^PATTERN=/     { p = substr($0, 9);  gsub(/"/, "", p) }
+      END { if (NR) print t "/" p }' "$PATHS_DIR"/*.conf 2>/dev/null)
+    while IFS= read -r -d '' d; do
+      while IFS=$'\t' read -r -d '' dev ino mt file; do
+        [ -n "$file" ] || continue
+        pg_copy_info "$file" "$hold" "$dev $ino $mt" || continue
+        # this path's copy unless its record names ANOTHER configured path (two paths in one folder share its
+        # copy folder). Without a record (removed by hand), or with one from before the path was edited, the
+        # folder decides: it is below this path.
+        if [ -n "$PG_COPY_REC" ] && [ "${#others[@]}" -gt 0 ]; then
+          pth=""; while IFS='=' read -r k v; do [ "$k" = PATH ] && pth=$v; done < "$PG_COPY_REC"
+          [ -n "$pth" ] && [ -n "${others[$pth]:-}" ] && continue
+        fi
+        copies+=("$PG_COPY_DUE"$'\t'"$file")
+      done < <(find "$d" -mindepth 1 -maxdepth 1 -type f -printf '%D\t%i\t%T@\t%p\0' 2>/dev/null)
+    done < <(find "$t" -mindepth 1 -type d -name "$PG_COPY_DIR" -prune -print0 2>/dev/null)
+  fi
+  [ "${#files[@]}" -gt 0 ] && printf '%s\0' "${files[@]}"
+  [ "${#copies[@]}" -gt 0 ] && printf '%s\0' "${copies[@]}" | sort -z -n -t $'\t' -k1,1 | cut -z -f2-
+  return 0
+}
+
 # pg_do_rotate <file> — rename aside, recreate with the same mode/owner, reload writers, verify.
 # rc: 0 done | 2 deferred (retry later) | 1 failed
 pg_do_rotate() {
@@ -2427,12 +2710,18 @@ pg_do_rotate() {
   fi
   pg_writers_check "$f"
   rkinds=$(det_proc_users "$f" | awk -F'|' '$4=="r" {print $3}' | sort -u | tr '\n' ' ')
-  read -r mode uid gid <<<"$(stat -c '%a %u %g' "$f")"
-  dest="${f}.purge-$(date +%s)"
+  local due key crec=""
+  read -r mode uid gid key <<<"$(stat -c '%a %u %g %d-%i' "$f")"
+  due=$(( $(date +%s) + ${HOLD_SEC:-$PG_GRACE_SEC} ))
+  pg_copy_dest "$f" "$due"; dest=$PG_DEST
   if [ -e "$dest" ]; then PG_WHY="rotation target already exists: $dest"; return 2; fi
   snap=$(pg_readers_snapshot "$f")
   if ! pg_watch_create "$dest" "$f" "$snap"; then PG_WHY="cannot write watch record in $PG_WATCH_DIR — not rotating"; return 2; fi
-  mv -- "$f" "$dest" || { rm -f "$(pg_watch_rec "$dest")"; PG_WHY="could not rename $f"; return 1; }
+  if [ -n "$PG_DEST_DIR" ]; then
+    crec="$PG_COPIES_DIR/$key.copy"
+    pg_copy_record "$dest" "$f" "$due" "$key" || { rm -f "$(pg_watch_rec "$dest")"; PG_WHY="cannot write copy record in $PG_COPIES_DIR — not rotating"; return 2; }
+  fi
+  pg_move_copy "$f" "$dest" || { rm -f "$(pg_watch_rec "$dest")" ${crec:+"$crec"}; PG_WHY="could not move $f to $dest"; return 1; }
   # recreate immediately so the file never stays missing, keeping its original permissions
   if ( set -C; : > "$f" ) 2>/dev/null; then chmod "$mode" "$f" 2>/dev/null; chown "$uid:$gid" "$f" 2>/dev/null; fi
   for c in ${PG_RELOAD_CMDS[@]+"${PG_RELOAD_CMDS[@]}"}; do
@@ -2455,7 +2744,7 @@ pg_do_rotate() {
     # opened the new file yet (replacing a file another process already writes would leave it writing into
     # a deleted file)
     if [ ! -s "$f" ] && [ -z "$(det_proc_users "$f")" ]; then
-      mv -f -- "$dest" "$f" && rm -f "$(pg_watch_rec "$dest")" && PG_WHY="writer did not reopen after reload — rotation rolled back"
+      mv -f -T -- "$dest" "$f" && rm -f "$(pg_watch_rec "$dest")" ${crec:+"$crec"} && PG_WHY="writer did not reopen after reload — rotation rolled back"
     else PG_WHY="writer still on $dest after reload while the new file is already in use — left in place"; fi
     log_error "$PG_WHY ($f)"
     return 1
@@ -2499,12 +2788,14 @@ pg_process_file() {
   local f="$1" due="$2" dry="$3" verbose="$4" force="$5"
   local sz base now mins age action rc why nlinks old=0 hold="${HOLD_SEC:-$PG_GRACE_SEC}"
   PG_FREED=0; PG_OUTCOME="idle"; PG_LIVE=""
-  sz=$(stat -c %s "$f" 2>/dev/null || echo 0); base="${f##*/}"; now=$(date +%s)
+  local cdue="" crec="" sdev="" sino="" smt=""
+  read -r sz sdev sino smt <<<"$(stat -c '%s %d %i %Y' -- "$f" 2>/dev/null)"
+  sz=${sz:-0}; base="${f##*/}"; now=$(date +%s)
   mins=$(unit_to_min "$RETENTION_VALUE" "$RETENTION_UNIT")
-  pg_old_name "$base" && old=1
+  if [ -n "$smt" ] && pg_copy_info "$f" "$hold" "$sdev $sino $smt"; then old=1; cdue=$PG_COPY_DUE; crec=$PG_COPY_REC; else pg_old_name "$base" && old=1; fi
   # In size / daily mode a date-named file (firewall_20261120.log) that a process still writes is today's live
   # file, not a finished one: without this it was never rotated and its size limit never applied.
-  if [ "$old" = 1 ] && [ "$RETENTION_UNIT" = "mb" -o "$RETENTION_UNIT" = "midnight" ] \
+  if [ "$old" = 1 ] && [ -z "$cdue" ] && [ "$RETENTION_UNIT" = "mb" -o "$RETENTION_UNIT" = "midnight" ] \
      && ! pg_rotated_name "$base" && pg_dated_name "$base"; then
     pg_writers_check "$f"; [ "$PG_WRITERS" -gt 0 ] && old=0
   fi
@@ -2525,13 +2816,13 @@ pg_process_file() {
 
   # ---- rotated / date-named / old file ---------------------------------------
   if [ "$old" = 1 ]; then
-    if [[ "$base" =~ \.purge-([0-9]+)$ ]]; then
-      if [ $(( now - BASH_REMATCH[1] )) -lt "$hold" ]; then
-        # Held copy. Early removal only to stop the disk filling up (a full disk makes writers drop new
-        # logs) — and even then only once every reader has finished it (checked below).
+    if [ -n "$cdue" ]; then
+      if [ "$now" -lt "$cdue" ]; then
+        # Held copy, until its delete time. Early removal only to stop the disk filling up (a full disk makes
+        # writers drop new logs) — and even then only once every reader has finished it (checked below).
         local use; use=$(df --output=pcent "$f" 2>/dev/null | tail -1 | tr -dc '0-9')
         [ "${use:-0}" -ge "$PG_DISK_EMERGENCY_PCT" ] || return 0
-        [ "$dry" = "1" ] || log_warn "disk at ${use}% (>= ${PG_DISK_EMERGENCY_PCT}%): releasing fully-read copy $f before its ${hold}s hold ends"
+        [ "$dry" = "1" ] || log_warn "disk at ${use}% (>= ${PG_DISK_EMERGENCY_PCT}%): releasing fully-read copy $f before its delete time ($(pg_when "$cdue"))"
       fi
       if pg_watch_open "$f"; then pg_skip "$f" "a reader has not finished this copy yet (watch record open)"; PG_OUTCOME="deferred"; return 0; fi
     else
@@ -2539,7 +2830,8 @@ pg_process_file() {
       age=$(( now - $(stat -c %Y "$f" 2>/dev/null || echo "$now") ))
       [ "$age" -ge $(( mins * 60 )) ] || return 0
     fi
-    local kind="rotated file"; pg_rotated_name "$base" || kind="date-named file"
+    local kind="rotated file"
+    if [ -n "$cdue" ]; then kind="rotated copy"; elif ! pg_rotated_name "$base"; then kind="date-named file"; fi
     if ! pg_finished_file_check "$f"; then
       pg_skip "$f" "$kind kept: $PG_WHY"; PG_OUTCOME="deferred"
       [ -n "$verbose" ] && [ "$dry" = "1" ] && pg_say "$C_DIM" "$f" "kept: $PG_WHY"
@@ -2556,6 +2848,7 @@ pg_process_file() {
       # removing one name of a hard-linked file releases no space until the last name goes
       [ "$nlinks" -le 1 ] && PG_FREED=$sz
       PG_OUTCOME="acted"; PG_SKIP_SEEN["$f"]=""
+      [ -n "$crec" ] && rm -f "$crec"
       log_info "deleted $kind $f ($(human "$sz"))"
       [ -n "$verbose" ] && pg_say "$C_GREEN" "$f" "deleted $kind ($(human "$sz"))"
     else
@@ -2571,12 +2864,10 @@ pg_process_file() {
   if [ -n "$PG_BLOCK" ]; then pg_skip "$f" "$PG_BLOCK"; PG_OUTCOME="deferred"; PG_LIVE="pending"; return 0; fi
   pg_writers_check "$f"
   if [ "$PG_WRITERS" -eq 0 ]; then
-    # Holds nobody, but written within the last minute: most likely its writer was just told to reopen. rsyslog
-    # closes ALL its files on the HUP sent when the previous file of this pass was rotated, and opens each again
-    # on its next write. Deciding "nobody writes it" at that moment left busy files unrotated for a day
-    # (seen on a log receiver, v2.6.7). Wait for the writer to come back first.
+    # Holds nobody (and no rsyslog config names it — pg_writers_check), but written within the last
+    # PG_RECENT_WRITE_SEC: its writer may have just been told to reopen. Wait for it to come back first.
     local mt w=0; mt=$(stat -c %Y "$f" 2>/dev/null || echo 0)
-    if [ $(( now - mt )) -lt 60 ]; then
+    if [ $(( now - mt )) -lt "$PG_RECENT_WRITE_SEC" ]; then
       while [ "$w" -lt "$PG_VERIFY_SEC" ] && [ "$PG_WRITERS" -eq 0 ]; do sleep 1; w=$(( w + 1 )); pg_writers_check "$f"; done
       if [ "$PG_WRITERS" -eq 0 ]; then
         case "$RETENTION_UNIT" in
@@ -2598,7 +2889,14 @@ pg_process_file() {
     case "$RETENTION_UNIT" in
       hours|days|weeks|months)
         age=$(( now - $(stat -c %Y "$f" 2>/dev/null || echo "$now") ))
-        if [ "$age" -lt $(( mins * 60 )) ]; then PG_OUTCOME="idle"; PG_LIVE="acted"; return 0; fi
+        if [ "$age" -lt $(( mins * 60 )) ]; then
+          # not silent: say once why a non-empty file that was due is left as it is
+          if [ "$dry" != "1" ] && [ -z "${PG_PLAN_QUIET:-}" ] && [ "${PG_SKIP_SEEN[idle:$f]:-}" != 1 ]; then
+            PG_SKIP_SEEN["idle:$f"]=1
+            log_info "not rotated: $f — no process has it open and no rsyslog config writes it, so it counts as finished; it is set aside once unwritten for ${RETENTION_VALUE} ${RETENTION_UNIT}"
+          fi
+          PG_OUTCOME="idle"; PG_LIVE="acted"; return 0
+        fi
         if [ "$PG_UNREAD" -gt 0 ]; then pg_skip "$f" "readers have not finished it ($(human "$PG_UNREAD") unread)"; PG_OUTCOME="deferred"; PG_LIVE="pending"; return 0; fi
         action="retire";;
       *) action="rotate";;
@@ -2638,16 +2936,21 @@ pg_process_file() {
   case "$action" in
     rotate) pg_do_rotate "$f"; rc=$?;;
     retire)
-      local rdest="${f}.purge-${now}" rsnap
+      local rdest rsnap rdue=$(( now + hold )) rkey rrec=""
+      rkey=$(stat -c '%d-%i' -- "$f" 2>/dev/null)
+      pg_copy_dest "$f" "$rdue"; rdest=$PG_DEST
+      [ -n "$PG_DEST_DIR" ] && rrec="$PG_COPIES_DIR/$rkey.copy"
       rsnap=$(pg_readers_snapshot "$f")
       if [ -e "$rdest" ]; then rc=2; PG_WHY="target already exists: $rdest"
       elif ! pg_watch_create "$rdest" "$f" "$rsnap"; then rc=2; PG_WHY="cannot write watch record in $PG_WATCH_DIR"
-      elif mv -- "$f" "$rdest"; then rc=0; log_info "set aside stale file $f -> $rdest ($(human "$sz"), unwritten for ${age}s; deleted after the ${PG_GRACE_SEC}s hold)"
-      else rm -f "$(pg_watch_rec "$rdest")"; rc=1; PG_WHY="could not rename (check permissions/chattr)"; fi;;
+      elif [ -n "$rrec" ] && ! pg_copy_record "$rdest" "$f" "$rdue" "$rkey"; then
+        rm -f "$(pg_watch_rec "$rdest")"; rc=2; PG_WHY="cannot write copy record in $PG_COPIES_DIR"
+      elif pg_move_copy "$f" "$rdest"; then rc=0; log_info "set aside stale file $f -> $rdest ($(human "$sz"), unwritten for ${age}s; deleted at $(pg_when "$rdue"))"
+      else rm -f "$(pg_watch_rec "$rdest")" ${rrec:+"$rrec"}; rc=1; PG_WHY="could not move it to $rdest (check permissions/chattr)"; fi;;
     *)      pg_do_truncate "$f"; rc=$?;;
   esac
   case "$rc" in
-    0) PG_OUTCOME="acted"; PG_LIVE="acted"; PG_SKIP_SEEN["$f"]=""; unset "PG_NEXT_TRY[$f]" 2>/dev/null
+    0) PG_OUTCOME="acted"; PG_LIVE="acted"; PG_SKIP_SEEN["$f"]=""; PG_SKIP_SEEN["idle:$f"]=""; unset "PG_NEXT_TRY[$f]" 2>/dev/null
        { [ "$action" = "truncate" ] || { [ "$action" = "delete" ] && [ "$nlinks" -le 1 ]; }; } && PG_FREED=$sz
        [ -n "$verbose" ] && pg_say "$C_GREEN" "$f" "${action}d ($(human "$sz"))";;
     2) pg_skip "$f" "$PG_WHY"; PG_OUTCOME="deferred"; PG_LIVE="pending";;
@@ -2719,15 +3022,9 @@ purge_one_path() {
   # Below the disk limit the order does not matter. At the limit a held copy is released only while the
   # disk is still at the limit (re-checked per copy), so this order frees the oldest hours and keeps the
   # newest ones in one unbroken run — folder order released random hours and left gaps.
-  local -a pg_files=() pg_copies=()
-  while IFS= read -r -d '' file; do
-    if [[ "${file##*/}" =~ \.purge-([0-9]+)$ ]]; then pg_copies+=("${BASH_REMATCH[1]}"$'\t'"$file")
-    else pg_files+=("$file"); fi
-  done < <(find "$TARGET_PATH" -type f \( -name "$PATTERN" -o -name "${PATTERN}.purge-*" \) -print0 2>/dev/null)
-  if [ "${#pg_copies[@]}" -gt 0 ]; then
-    while IFS= read -r -d '' file; do pg_files+=("${file#*$'\t'}"); done \
-      < <(printf '%s\0' "${pg_copies[@]}" | sort -z -n -t $'\t' -k1,1)
-  fi
+  local -a pg_files=()
+  while IFS= read -r -d '' file; do pg_files+=("$file"); done \
+    < <(pg_path_files "$TARGET_PATH" "$PATTERN" "${HOLD_SEC:-$PG_GRACE_SEC}")
 
   for file in ${pg_files[@]+"${pg_files[@]}"}; do
     [ -L "$file" ] && { log_warn "skip (symlink): $file"; continue; }
@@ -2798,7 +3095,7 @@ conf_update_run() {
 do_worker() {
   local verbose="${1:-}" force="${2:-}" dry="${3:-}"
   local f
-  [ "$dry" = "1" ] || pg_watch_all
+  [ "$dry" = "1" ] || { pg_watch_all; pg_copies_sweep; }
   for f in $(list_confs); do
     purge_one_path "$f" "$verbose" "$force" "$dry" || log_error "worker failed processing: $f"
   done
@@ -2866,6 +3163,10 @@ settings_edit() {
         size) echo "Enter a size, e.g. 64MB, 1GB";;
         hhmm) echo "Enter a time of day, e.g. 23:55";;
         path) echo "Enter an absolute path";;
+        dirname) echo "Enter a folder name, e.g. purged (it is made inside each log's own folder), or off";;
+        copyname) echo "Enter the copy name. {name} = the log's name, {ext} = its ending (.log); date codes give its delete time:"
+                  echo "  %d day  %b month (Nov)  %Y year  %I hour (12h)  %H hour (24h)  %M min  %S sec  %p AM/PM  %Z time zone"
+                  echo "  now: $(LC_ALL=C date -d "@$(( $(date +%s) + PG_GRACE_SEC ))" +"$PG_COPY_NAME" | sed 's/{name}/app/; s/{ext}/.log/')  (for app.log)";;
       esac
       read -rp "New value (Enter = keep, 'default' = reset): " ans
       [ -n "$ans" ] || return
@@ -3062,14 +3363,18 @@ path_plan() {
   echo "${C_BOLD}Plan for ${target}${C_RESET}${C_DIM}  (pattern ${pattern}; ${RETENTION_VALUE} ${RETENTION_UNIT}; rotated copies held $(human_secs "${HOLD_SEC:-$PG_GRACE_SEC}"); empty in place: $([ "${PATH_ALLOW_TRUNCATE:-$PG_ALLOW_TRUNCATE}" = 1 ] && echo on || echo off))${C_RESET}"
   [ -d "$target" ] || { echo "   ${C_YELLOW}the folder does not exist yet — nothing to do until it does${C_RESET}"; return 0; }
   tmp=$(mktemp)
-  # newest files first (the live ones are normally the newest)
+  # newest files first (the live ones are normally the newest). Listed by find alone, not per file: a big
+  # folder (/opt) holds many thousands of files and only the first few are shown. Copy folders are listed apart.
+  local -a pprune=()
+  [ "$PG_COPY_DIR" != off ] && pprune=( -mindepth 1 \( -type d -name "$PG_COPY_DIR" -prune \) -o )
   while IFS= read -r -d '' f; do
     [ -e "$f" ] || continue          # removed while the plan was being built (e.g. by the running service)
     total=$(( total + 1 ))
     [ "$shown" -ge "$maxshow" ] && continue
     shown=$(( shown + 1 ))
-    base="${f##*/}"; kind="live log"
-    if pg_rotated_name "$base"; then kind="already rotated"; elif pg_dated_name "$base"; then kind="date-named (finished once its day is over)"; fi
+    base="${f##*/}"; kind="live log"; local pcdue=""
+    if pg_copy_info "$f" "${HOLD_SEC:-$PG_GRACE_SEC}"; then pcdue=$PG_COPY_DUE; kind="rotated copy, deleted at $(pg_when "$pcdue")"
+    elif pg_rotated_name "$base"; then kind="already rotated"; elif pg_dated_name "$base"; then kind="date-named (finished once its day is over)"; fi
     age=$(( ( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || date +%s) ) / 3600 ))
     printf "   %s %s  ${C_DIM}(%s, %s, last written %sh ago)${C_RESET}\n" "$(dot "$C_CYAN")" "$f" "$kind" "$(human "$(stat -c %s "$f" 2>/dev/null || echo 0)")" "$age"
     plan_who "$f"
@@ -3077,13 +3382,15 @@ path_plan() {
     out=$(sed 's/\x1b\[[0-9;]*m//g; s/^.*  -> //; s/^dry-run: //' "$tmp" | tail -1)
     if [ -n "$out" ]; then
       case "$out" in
-        would\ rotate*) out="rotate it $(plan_schedule_text); keep the old copy $(human_secs "${HOLD_SEC:-$PG_GRACE_SEC}"), then delete it once every reader has finished";;
+        would\ rotate*) out="rotate it $(plan_schedule_text); keep the old copy $([ "$PG_COPY_DIR" != off ] && echo "in ${f%/*}/$PG_COPY_DIR/ ")for $(human_secs "${HOLD_SEC:-$PG_GRACE_SEC}"), then delete it once every reader has finished";;
         would\ delete*) out="delete it now: older than ${RETENTION_VALUE} ${RETENTION_UNIT} and every reader has finished it";;
         would\ retire*) out="set it aside and delete it after $(human_secs "${HOLD_SEC:-$PG_GRACE_SEC}") (nobody writes it any more)";;
         would\ truncate*) out="empty it in place $(plan_schedule_text) (writer cannot reopen; allowed for this path)";;
       esac
     elif [ "$PG_OUTCOME" = skipped ] || [ "$PG_OUTCOME" = deferred ]; then
       out="leave it alone for now — ${PG_WHY}"
+    elif [ -n "$pcdue" ]; then
+      out="keep it until $(pg_when "$pcdue") (earlier only if the disk reaches ${PG_DISK_EMERGENCY_PCT}%), then delete it once every reader has finished"
     elif pg_old_name "$base"; then
       out="keep it until it is older than ${RETENTION_VALUE} ${RETENTION_UNIT}, then delete it once every reader has finished"
     elif [ "$(stat -c %s "$f" 2>/dev/null || echo 0)" -eq 0 ]; then
@@ -3092,8 +3399,10 @@ path_plan() {
       out="nobody writes it now; once it is older than ${RETENTION_VALUE} ${RETENTION_UNIT} it is set aside, kept $(human_secs "${HOLD_SEC:-$PG_GRACE_SEC}"), then deleted"
     fi
     printf "      plan:       %s\n" "$out"
-  done < <(find "$target" -type f \( -name "$pattern" -o -name "${pattern}.purge-*" \) -printf '%T@\t%p\0' 2>/dev/null \
-            | sort -z -t$'\t' -k1,1nr | cut -z -f2-)
+  done < <( { find "$target" ${pprune[@]+"${pprune[@]}"} -type f \( -name "$pattern" -o -name "${pattern}.purge-*" \) -printf '%T@\t%p\0' 2>/dev/null
+              [ "$PG_COPY_DIR" != off ] && find "$target" -mindepth 1 -type d -name "$PG_COPY_DIR" -prune \
+                  -exec find {} -mindepth 1 -maxdepth 1 -type f -printf '%T@\t%p\0' \; 2>/dev/null
+            } | sort -z -t$'\t' -k1,1nr | cut -z -f2-)
   rm -f "$tmp"
   [ "$total" -eq 0 ] && echo "   ${C_DIM}no matching files yet — they will be handled as they appear${C_RESET}"
   [ "$total" -gt "$shown" ] && echo "   ${C_DIM}… and $(( total - shown )) more file(s), handled the same way${C_RESET}"
@@ -3347,7 +3656,7 @@ main() {
       require_root "$@"; [ -n "${2:-}" ] || die "usage: purgingconsole --check <file>"
       [ -e "$2" ] || { echo "No such file: $2 (it may already have been purged — see: grep \"${2##*/}\" $LOG_FILE)"; exit 1; }
       pg_consumers_check "$2"; pg_writers_check "$2"
-      echo "unread=${PG_UNREAD}B block='${PG_BLOCK}' writers=${PG_WRITERS} all_append=${PG_ALL_APPEND} unreloadable=${PG_UNRELOADABLE} reload=[${PG_RELOAD_CMDS[*]:-}]"
+      echo "unread=${PG_UNREAD}B block='${PG_BLOCK}' writers=${PG_WRITERS}$([ -n "$PG_WRITER_CONF" ] && echo " (from the ${PG_WRITER_CONF} config, not open right now)") all_append=${PG_ALL_APPEND} unreloadable=${PG_UNRELOADABLE} reload=[${PG_RELOAD_CMDS[*]:-}]"
       echo "truncate-blockers: $(pg_truncate_blockers "$2")"; exit 0;;
     --stats)
       collect_stats
