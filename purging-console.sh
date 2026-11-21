@@ -26,7 +26,7 @@ set -u
 # SECTION: Constants & Global State
 # ============================================================
 readonly APP_NAME="Purging Management Console"
-readonly APP_VERSION="2.6.7"
+readonly APP_VERSION="2.6.8"
 readonly CONFIG_SCHEMA_VERSION=2
 readonly CONF_DIR="/etc/darshan/purging"
 readonly PATHS_DIR="${CONF_DIR}/paths.d"
@@ -95,7 +95,11 @@ SETTINGS_MTIME=""
 
 settings_keys() { awk -F'\t' 'NF>=4 && $1!="" {print $1}' <<<"$SETTINGS_REGISTRY"; }
 settings_field() { awk -F'\t' -v k="$1" -v n="$2" '$1==k {print $n; exit}' <<<"$SETTINGS_REGISTRY"; }  # 2 type 3 default 4 group 5 label
-list_items() { local v="${!1:-}" IFS='|' i; for i in $v; do [ -n "$i" ] && printf '%s\n' "$i"; done; return 0; }
+list_items() {   # never glob-expanded: an item like *.pos must not turn into a file name from the current folder
+  local v="${!1:-}" i; local -a _li=()
+  IFS='|' read -r -a _li <<<"$v"
+  for i in ${_li[@]+"${_li[@]}"}; do [ -n "$i" ] && printf '%s\n' "$i"; done; return 0
+}
 # list_glob <KEY> — the list's items with shell globs expanded to existing files
 list_glob() { local i m; while IFS= read -r i; do for m in $i; do [ -e "$m" ] && printf '%s\n' "$m"; done; done < <(list_items "$1"); return 0; }
 
@@ -106,7 +110,10 @@ settings_normalize() {
   [ -n "$t" ] || { echo "unknown setting '$key'"; return 1; }
   raw="${raw#"${raw%%[![:space:]]*}"}"; raw="${raw%"${raw##*[![:space:]]}"}"
   case "$t" in
-    dur)  v=$(parse_duration_sec "$raw") || { echo "use a time like 30s, 15m, 2h, 1d"; return 1; }; echo "$v";;
+    dur)  v=$(parse_duration_sec "$raw") || { echo "use a time like 30s, 15m, 2h, 1d"; return 1; }
+          # the service loop and the writer check need a real interval: 0 would spin a CPU core
+          case "$key" in PG_TICK_SEC|PG_PASS_SEC|PG_VERIFY_SEC) [ "$v" -ge 1 ] || { echo "use at least 1s"; return 1; };; esac
+          echo "$v";;
     pct)  v="${raw%\%}"; [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] && [ "$v" -le 100 ] || { echo "use a percentage from 1 to 100"; return 1; }; echo "$v";;
     bool) case "${raw,,}" in on|yes|1|true|enable|enabled) echo 1;; off|no|0|false|disable|disabled) echo 0;; *) echo "use on or off"; return 1;; esac;;
     size) [[ "${raw^^}" =~ ^([0-9]+)[[:space:]]*(B|K|KB|M|MB|G|GB)?$ ]] || { echo "use a size like 64MB or 1GB"; return 1; }
@@ -115,10 +122,14 @@ settings_normalize() {
           echo "$n";;
     hhmm) [[ "$raw" =~ ^([01]?[0-9]|2[0-3]):?([0-5][0-9])$ ]] || { echo "use a time of day like 23:55"; return 1; }
           printf '%02d%02d\n' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[2]}))";;
-    path) [[ "$raw" = /* ]] || { echo "use an absolute path"; return 1; }; echo "$raw";;
+    path) [[ "$raw" = /* ]] || { echo "use an absolute path"; return 1; }
+          [[ "$raw" == *[\"$'\n\r']* ]] && { echo "the path contains a quote or a line break"; return 1; }
+          echo "$raw";;
     list:*)
-      local IFS='|'
-      for item in $raw; do
+      local -a _items=()
+      IFS='|' read -r -a _items <<<"$raw"           # split without glob expansion
+      for item in ${_items[@]+"${_items[@]}"}; do
+        [[ "$item" == *[\"$'\n\r']* ]] && { echo "'$item' contains a quote or a line break"; return 1; }
         item="${item#"${item%%[![:space:]]*}"}"; item="${item%"${item##*[![:space:]]}"}"
         [ -n "$item" ] || continue
         case "$t" in
@@ -160,6 +171,7 @@ settings_load() {
   done < <(settings_keys)
   if [ -r "$SETTINGS_FILE" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
+      line="${line%$'\r'}"                         # a file edited on Windows must not keep a stray \r
       [[ "$line" =~ ^[[:space:]]*([A-Z_]+)=(.*)$ ]] || continue
       k=${BASH_REMATCH[1]}; v=${BASH_REMATCH[2]}
       v="${v#\"}"; v="${v%\"}"
@@ -167,7 +179,7 @@ settings_load() {
       if norm=$(settings_normalize "$k" "$v"); then printf -v "$k" '%s' "$norm"; SETTINGS_FROM[$k]=file
       else log_warn "engine.conf: ignoring $k ($norm)"; fi
     done < "$SETTINGS_FILE"
-    SETTINGS_MTIME=$(stat -c %Y "$SETTINGS_FILE" 2>/dev/null)
+    SETTINGS_MTIME=$(stat -c '%y %i' "$SETTINGS_FILE" 2>/dev/null)   # ns + inode: two saves in one second still differ
   else
     SETTINGS_MTIME=""
   fi
@@ -182,7 +194,7 @@ settings_load() {
 
 # settings_reload_if_changed — the background service picks up console changes without a restart
 settings_reload_if_changed() {
-  local m; m=$(stat -c %Y "$SETTINGS_FILE" 2>/dev/null)
+  local m; m=$(stat -c '%y %i' "$SETTINGS_FILE" 2>/dev/null)
   if [ "$m" != "$SETTINGS_MTIME" ]; then settings_load; log_info "settings reloaded from $SETTINGS_FILE"; fi
 }
 
@@ -190,6 +202,9 @@ settings_reload_if_changed() {
 settings_save() {
   local key="$1" val="$2" tmp k
   mkdir -p "$CONF_DIR" && chmod 700 "$CONF_DIR" 2>/dev/null
+  # Start from what is on disk now. Another console or a --set may have saved since this process loaded;
+  # writing the file from this process's memory would silently undo those changes.
+  settings_load
   tmp="$SETTINGS_FILE.tmp.$$"
   {
     echo "# Purging Management Console — engine settings (edit from the console: purgingconsole → c)"
@@ -387,6 +402,29 @@ is_safe_path() {
   return 0
 }
 
+# safe_target <folder> — the folder a path config will actually search (after splitting off the file name).
+# Echoes its canonical form (no "..", no symlinks) or, with rc 1, why it is refused. Checking only what the
+# user typed is not enough: "/*.log" passes as a string but would make the whole disk ("/") the target.
+safe_target() {
+  local d="${1%/}" c msg
+  [ -n "$d" ] || d="/"
+  [[ "$d" = /* ]] || { echo "Path must be absolute (start with /)."; return 1; }
+  [[ "$d" == *[\"$'\n\r']* ]] && { echo "The path contains a quote or a line break."; return 1; }
+  c=$(realpath -m -- "$d" 2>/dev/null) || c="$d"
+  [ "$c" = "/" ] && { echo "Refusing to manage the whole disk (/) — add the folder that holds the logs."; return 1; }
+  msg=$(is_safe_path "$c") || { echo "$msg"; return 1; }
+  if [ "$c" != "$d" ]; then msg=$(is_safe_path "$d") || { echo "$msg"; return 1; }; fi
+  echo "$c"
+}
+
+# safe_pattern <pattern> — a file-name pattern: no folder part, no quote or line break
+safe_pattern() {
+  [ -n "$1" ] || { echo "The file pattern is empty."; return 1; }
+  [[ "$1" == */* ]] && { echo "The file pattern cannot contain '/' (put the folder in the path)."; return 1; }
+  [[ "$1" == *[\"$'\n\r']* ]] && { echo "The file pattern contains a quote or a line break."; return 1; }
+  return 0
+}
+
 # ============================================================
 # SECTION: Dependency & Environment Validation
 # ============================================================
@@ -411,7 +449,9 @@ check_dependencies() {
 validate_conf_values() {
   local target="$1" pattern="$2" value="$3" unit="$4" enabled="$5"
   [[ "$target" = /* ]] || { echo "TARGET_PATH not absolute: '$target'"; return 1; }
-  [ -n "$pattern" ] || { echo "PATTERN is empty"; return 1; }
+  [ "${target%/}" != "" ] || { echo "TARGET_PATH is the whole disk (/)"; return 1; }
+  [[ "$target" == *[\"$'\n\r']* ]] && { echo "TARGET_PATH contains a quote or line break"; return 1; }
+  safe_pattern "$pattern" >/dev/null || { echo "PATTERN not allowed: '$pattern'"; return 1; }
   [[ "$value" =~ ^[0-9]+$ ]] || { echo "RETENTION_VALUE not numeric: '$value'"; return 1; }
   case "$unit" in hours|days|weeks|months|mb|midnight) ;; *) echo "unknown RETENTION_UNIT: '$unit'"; return 1;; esac
   [[ "$enabled" =~ ^[01]$ ]] || { echo "ENABLED must be 0 or 1: '$enabled'"; return 1; }
@@ -454,10 +494,24 @@ list_confs() { ls -1 "$PATHS_DIR"/*.conf 2>/dev/null; }
 
 count_confs() { list_confs | wc -l | tr -d ' '; }
 
-# load_conf <file> — sources a conf file into caller scope after validating it
-# is a well-formed, safe shell fragment. Returns 1 (and logs) on corruption.
+# conf locking: the service writes a path's bookkeeping back after each pass, and the console / CLI edit,
+# disable and remove paths. Both take this lock, so neither writes over the other. Re-entrant per process.
+with_conf_lock() {
+  if [ -n "${PG_CONF_LOCKED:-}" ]; then "$@"; return; fi
+  local rc
+  mkdir -p "$CONF_DIR" 2>/dev/null
+  {
+    flock -w 30 8 || { echo "the path list is busy (another change is being saved) — try again" >&2; return 1; }
+    PG_CONF_LOCKED=1; "$@"; rc=$?; PG_CONF_LOCKED=""
+  } 8>"$CONF_DIR/.conf.lock"
+  return "$rc"
+}
+
+# load_conf <file> — reads a conf file into the caller's scope after validating it. It is parsed, never
+# executed: only the known keys are taken, as literal text, so nothing in a conf file (an imported one, or a
+# path name with $ or `) can run a command as root. Returns 1 (and logs) on corruption.
 load_conf() {
-  local f="$1"
+  local f="$1" line k v
   if [ ! -r "$f" ]; then log_error "config unreadable: $f"; return 1; fi
   # byte-wise (LC_ALL=C), so no character in a comment can depend on the locale; a single bad read (seen once
   # on a busy server, the file itself unchanged) is not a corrupted file, so look once more before saying so
@@ -470,8 +524,17 @@ load_conf() {
   fi
   TARGET_PATH=""; PATTERN="*"; RETENTION_VALUE=1; RETENTION_UNIT="days"
   ENABLED=0; LAST_PURGE=0; LAST_FREED=0; SCHEMA_VERSION=1; HOLD_SEC=""; PATH_ALLOW_TRUNCATE=""
-  # shellcheck disable=SC1090
-  source "$f"
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^([A-Z_]+)=(.*)$ ]] || continue
+    k=${BASH_REMATCH[1]}; v=${BASH_REMATCH[2]}
+    if [[ "$v" =~ ^\"(.*)\"$ ]] || [[ "$v" =~ ^\'(.*)\'$ ]]; then v=${BASH_REMATCH[1]}; fi
+    case "$k" in
+      TARGET_PATH|PATTERN|RETENTION_UNIT) printf -v "$k" '%s' "$v";;
+      RETENTION_VALUE|ENABLED|HOLD_SEC|PATH_ALLOW_TRUNCATE) printf -v "$k" '%s' "$v";;   # checked below
+      SCHEMA_VERSION|LAST_PURGE|LAST_FREED) [[ "$v" =~ ^[0-9]+$ ]] && printf -v "$k" '%s' "$v";;   # numbers only
+    esac
+  done < "$f"
   if [ -n "$HOLD_SEC" ] && ! [[ "$HOLD_SEC" =~ ^[0-9]+$ ]]; then
     log_error "config has an invalid HOLD_SEC ('$HOLD_SEC'), skipping: $f"; return 1
   fi
@@ -644,7 +707,7 @@ dashboard() {
   echo
   echo "${C_BOLD}Summary${C_RESET}"
   printf "  %-22s %s\n" "Configured paths:" "$STAT_TOTAL"
-  printf "  %-22s %s${C_RESET} / %s%s${C_RESET}\n" "Enabled / disabled:" "$C_GREEN" "$STAT_ENABLED" "  ${C_YELLOW}${STAT_DISABLED}"
+  printf "  %-22s %s%s${C_RESET} / %s%s${C_RESET}\n" "Enabled / disabled:" "$C_GREEN" "$STAT_ENABLED" "$C_YELLOW" "$STAT_DISABLED"
   printf "  %-22s %s\n" "Last run:" "$(rel_time "$STAT_LAST_RUN")"
   printf "  %-22s %s%s${C_RESET}\n" "Lifetime reclaimed:" "$C_GREEN" "$(human "$STAT_TOTAL_FREED")"
   if [ "$STAT_INVALID" -gt 0 ]; then
@@ -784,6 +847,34 @@ find_conf_by_target_pattern() {
   return 1
 }
 
+# replace_path_conf <target> <pattern> <value> <unit> <enabled> <last_purge> <last_freed> — writes the conf for
+# target+pattern (HOLD_SEC / PATH_ALLOW_TRUNCATE from the caller) and drops any other conf for the same pair.
+# Call under with_conf_lock.
+replace_path_conf() {
+  local id existing; id=$(path_id "$1/$2")
+  existing=$(find_conf_by_target_pattern "$1" "$2") && [ "$existing" != "$PATHS_DIR/$id.conf" ] && rm -f "$existing"
+  write_conf "$id" "$1" "$2" "$3" "$4" "$5" "$6" "$7"
+}
+
+# rewrite_path_conf <old conf file> <id> <target> <pattern> <value> <unit> <enabled> <last_purge> <last_freed>
+# writes <id>.conf and removes the old file if it had another name (a conf whose name is not the id of its
+# target+pattern would otherwise stay behind as a duplicate). Call under with_conf_lock.
+rewrite_path_conf() {
+  local old="$1" id="$2"; shift 2
+  write_conf "$id" "$@" || return 1
+  [ "$old" != "$PATHS_DIR/$id.conf" ] && rm -f "$old"
+  return 0
+}
+
+# check_new_path <target-folder> <pattern> — sets NP_TARGET (canonical folder), or NP_ERR (why not) with rc 1.
+# Call it directly, not inside $( ): the result is returned in those variables.
+check_new_path() {
+  NP_TARGET=""; NP_ERR=""
+  NP_TARGET=$(safe_target "$1") || { NP_ERR=$NP_TARGET; NP_TARGET=""; return 1; }
+  NP_ERR=$(safe_pattern "$2") || return 1
+  NP_ERR=""; return 0
+}
+
 add_path() {
   header
   echo "${C_BOLD}Add a purge path${C_RESET}"
@@ -825,19 +916,21 @@ add_path() {
       *) echo "${C_RED}Invalid choice.${C_RESET}"; pause; return;;
     esac
   fi
+  # check the folder that will really be searched, not just what was typed
+  if ! check_new_path "$target" "$pattern"; then echo "${C_RED}${NP_ERR}${C_RESET}"; pause; return; fi
+  [ "$NP_TARGET" != "$target" ] && echo "${C_DIM}→ folder resolved to ${NP_TARGET}${C_RESET}"
+  target=$NP_TARGET
 
   if ! pick_duration "$target" "$pattern"; then pause; return; fi
   HOLD_SEC=""; PATH_ALLOW_TRUNCATE=""
   path_options_prompt
 
-  # Remove any existing conf for the same target+pattern — prevents duplicates
-  local existing; existing=$(find_conf_by_target_pattern "$target" "$pattern") && rm -f "$existing"
-
   local id; id=$(path_id "${target}/${pattern}")
   local display_path initial_lp=0
   [ "$PICK_UNIT" = "midnight" ] && initial_lp=$(date +%s)
   if [[ "$pattern" != *"*"* ]]; then display_path="${target}/${pattern}"; else display_path="$target  (pattern: $pattern)"; fi
-  if write_conf "$id" "$target" "$pattern" "$PICK_VALUE" "$PICK_UNIT" 1 "$initial_lp" 0; then
+  # replaces any existing conf for the same target+pattern — prevents duplicates
+  if with_conf_lock replace_path_conf "$target" "$pattern" "$PICK_VALUE" "$PICK_UNIT" 1 "$initial_lp" 0; then
     success_msg "Saved. '${display_path}' will keep the last ${PICK_VALUE} ${PICK_UNIT}."
     load_conf "$PATHS_DIR/$id.conf" >/dev/null 2>&1 && path_plan "$target" "$pattern"
     log_info "path added/updated: ${target}/${pattern} retention=${PICK_VALUE}${PICK_UNIT}"
@@ -871,7 +964,7 @@ edit_path() {
   case "$c" in
     1)
       if pick_duration "$TARGET_PATH" "$PATTERN"; then
-        if write_conf "$id" "$TARGET_PATH" "$PATTERN" "$PICK_VALUE" "$PICK_UNIT" "$ENABLED" "$LAST_PURGE" "$LAST_FREED"; then
+        if with_conf_lock rewrite_path_conf "$f" "$id" "$TARGET_PATH" "$PATTERN" "$PICK_VALUE" "$PICK_UNIT" "$ENABLED" "$LAST_PURGE" "$LAST_FREED"; then
           success_msg "Updated."; log_info "retention changed for $TARGET_PATH -> ${PICK_VALUE}${PICK_UNIT}"
         else
           error_msg "Failed to write config — check permissions on $PATHS_DIR."
@@ -879,20 +972,20 @@ edit_path() {
       fi;;
     2)
       read -rp "New pattern [*]: " np; np="${np:-*}"
+      local pm; if ! pm=$(safe_pattern "$np"); then error_msg "$pm"; pause; return; fi
       local new_id; new_id=$(path_id "${TARGET_PATH}/${np}")
       if [ "$new_id" != "$id" ] && [ -f "$PATHS_DIR/$new_id.conf" ]; then
         error_msg "A config for '${TARGET_PATH}' with pattern '${np}' already exists — edit that entry instead."
         pause; return
       fi
-      if write_conf "$new_id" "$TARGET_PATH" "$np" "$RETENTION_VALUE" "$RETENTION_UNIT" "$ENABLED" "$LAST_PURGE" "$LAST_FREED"; then
-        [ "$new_id" != "$id" ] && rm -f "$PATHS_DIR/$id.conf"
+      if with_conf_lock rewrite_path_conf "$f" "$new_id" "$TARGET_PATH" "$np" "$RETENTION_VALUE" "$RETENTION_UNIT" "$ENABLED" "$LAST_PURGE" "$LAST_FREED"; then
         success_msg "Pattern updated."; log_info "pattern changed for $TARGET_PATH -> $np"
       else
         error_msg "Failed to write config — check permissions on $PATHS_DIR."
       fi;;
     3)
       path_options_prompt
-      if write_conf "$id" "$TARGET_PATH" "$PATTERN" "$RETENTION_VALUE" "$RETENTION_UNIT" "$ENABLED" "$LAST_PURGE" "$LAST_FREED"; then
+      if with_conf_lock rewrite_path_conf "$f" "$id" "$TARGET_PATH" "$PATTERN" "$RETENTION_VALUE" "$RETENTION_UNIT" "$ENABLED" "$LAST_PURGE" "$LAST_FREED"; then
         success_msg "Updated."; log_info "path options changed for $TARGET_PATH/$PATTERN: hold=${HOLD_SEC:-default} truncate=${PATH_ALLOW_TRUNCATE:-default}"
       else
         error_msg "Failed to write config — check permissions on $PATHS_DIR."
@@ -913,7 +1006,7 @@ toggle_path() {
   load_conf "$f" || { echo "${C_RED}That config is corrupted — use Health Check to repair it.${C_RESET}"; pause; return; }
   local id new; id=$(path_id "${TARGET_PATH}/${PATTERN}")
   if [ "$ENABLED" = "1" ]; then new=0; else new=1; fi
-  if write_conf "$id" "$TARGET_PATH" "$PATTERN" "$RETENTION_VALUE" "$RETENTION_UNIT" "$new" "$LAST_PURGE" "$LAST_FREED"; then
+  if with_conf_lock rewrite_path_conf "$f" "$id" "$TARGET_PATH" "$PATTERN" "$RETENTION_VALUE" "$RETENTION_UNIT" "$new" "$LAST_PURGE" "$LAST_FREED"; then
     [ "$new" = "1" ] && success_msg "Enabled purging for $TARGET_PATH" || warn_msg "Disabled purging for $TARGET_PATH"
     log_info "path $TARGET_PATH enabled=$new"
   else
@@ -935,7 +1028,7 @@ remove_path() {
   if [[ "$PATTERN" != *"*"* ]]; then _display="${TARGET_PATH}/${PATTERN}"; else _display="$TARGET_PATH (pattern: $PATTERN)"; fi
   echo "${C_YELLOW}This only stops managing '${_display}'. No files are deleted now.${C_RESET}"
   if confirm "Remove from management?"; then
-    rm -f "$f"; success_msg "Removed."; log_info "path removed from management: ${TARGET_PATH}/${PATTERN}"
+    with_conf_lock rm -f "$f"; success_msg "Removed."; log_info "path removed from management: ${TARGET_PATH}/${PATTERN}"
   fi
   pause
 }
@@ -1102,7 +1195,12 @@ backup_configuration() {  # backup_configuration [dest_file]
   mkdir -p "$BACKUP_DIR" 2>/dev/null
   [ -z "$dest" ] && dest="${BACKUP_DIR}/purging-config-$(date +%Y%m%d-%H%M%S).tar.gz"
   if [ ! -d "$CONF_DIR" ]; then echo "error: nothing to back up — $CONF_DIR does not exist" >&2; return 1; fi
-  if tar -czf "$dest" -C "$(dirname "$CONF_DIR")" "$(basename "$CONF_DIR")" 2>/dev/null; then
+  # only the configuration: not earlier backups (each backup would contain all the previous ones and double
+  # in size), not lock or temp files
+  local b; b=$(basename "$CONF_DIR")
+  if tar -czf "$dest" -C "$(dirname "$CONF_DIR")" --exclude="$b/backups" --exclude="$b/.*.lock" --exclude="$b/*.tmp.*" \
+       --exclude="$b/paths.d/.*" "$b" 2>/dev/null; then
+    chmod 600 "$dest" 2>/dev/null
     echo "Backup written to: $dest"
     log_success "configuration backed up to $dest"
     return 0
@@ -1114,24 +1212,48 @@ backup_configuration() {  # backup_configuration [dest_file]
 }
 
 restore_configuration() {  # restore_configuration <archive>
-  local src="$1"
+  local src="$1" b tmp bad f n=0 skipped=0
   [ -f "$src" ] || { echo "error: backup file not found: $src" >&2; return 1; }
   if ! tar -tzf "$src" >/dev/null 2>&1; then
     echo "error: '$src' is not a valid tar.gz archive" >&2
     return 1
   fi
+  # Only a backup made by this tool is accepted: nothing in it may land outside the config folder. It is
+  # unpacked into a temporary folder first and every path config is checked before anything is replaced.
+  b=$(basename "$CONF_DIR")
+  bad=$(tar -tzf "$src" 2>/dev/null | grep -vE "^(\./)?${b}/?\$|^(\./)?${b}/(engine\.conf|\.installed|\.[a-z]+\.lock|paths\.d/?|paths\.d/[0-9A-Za-z_.-]+\.conf|backups(/.*)?)\$" | head -1)
+  [ -z "$bad" ] || { echo "error: '$src' is not a backup of this tool (unexpected entry: $bad) — nothing restored" >&2; return 1; }
+  tmp=$(mktemp -d) || { echo "error: cannot create a temporary folder" >&2; return 1; }
+  if ! tar -xzf "$src" -C "$tmp" --no-same-owner --exclude="$b/backups" 2>/dev/null \
+     || [ -n "$(find "$tmp" ! -type f ! -type d 2>/dev/null | head -1)" ]; then
+    rm -rf "$tmp"; echo "error: '$src' could not be unpacked safely — nothing restored" >&2; return 1
+  fi
   local safety; safety="${BACKUP_DIR}/pre-restore-$(date +%Y%m%d-%H%M%S).tar.gz"
   backup_configuration "$safety" >/dev/null 2>&1
-  if tar -xzf "$src" -C "$(dirname "$CONF_DIR")" 2>/dev/null; then
-    echo "Restored configuration from: $src"
-    echo "(pre-restore safety backup saved to: $safety)"
-    log_success "configuration restored from $src"
-    return 0
-  else
-    echo "error: restore failed" >&2
-    log_error "restore failed from $src"
-    return 1
-  fi
+  _restore_apply() {
+    local c
+    for c in "$PATHS_DIR"/*.conf; do [ -e "$c" ] && rm -f "$c"; done    # paths added after the backup go too
+    for f in "$tmp/$b/paths.d"/*.conf; do
+      [ -e "$f" ] || continue
+      if load_conf "$f" 2>/dev/null && check_new_path "$TARGET_PATH" "$PATTERN"; then
+        replace_path_conf "$NP_TARGET" "$PATTERN" "$RETENTION_VALUE" "$RETENTION_UNIT" "$ENABLED" "$LAST_PURGE" "$LAST_FREED" && n=$(( n + 1 ))
+      else
+        skipped=$(( skipped + 1 )); echo "skipped ${f##*/}: ${NP_ERR:-invalid config}" >&2
+      fi
+    done
+    if [ -f "$tmp/$b/engine.conf" ]; then
+      install -m 600 "$tmp/$b/engine.conf" "$SETTINGS_FILE.tmp.$$" && mv -f "$SETTINGS_FILE.tmp.$$" "$SETTINGS_FILE"
+    else
+      rm -f "$SETTINGS_FILE"                                           # the backup had only default settings
+    fi
+  }
+  with_conf_lock _restore_apply
+  rm -rf "$tmp"
+  settings_load
+  echo "Restored configuration from: $src  (${n} path(s)$([ "$skipped" -gt 0 ] && echo ", ${skipped} skipped"))"
+  echo "(pre-restore safety backup saved to: $safety)"
+  log_success "configuration restored from $src (${n} paths, ${skipped} skipped)"
+  return 0
 }
 
 export_configuration() {  # export_configuration <dest_file>
@@ -1151,19 +1273,32 @@ import_configuration() {  # import_configuration <src_file>
   local src="$1"
   [ -f "$src" ] || { echo "error: file not found: $src" >&2; return 1; }
   mkdir -p "$PATHS_DIR" 2>/dev/null
-  local current="" imported=0
-  while IFS= read -r line; do
+  # Each "## <name>.conf" section is collected in a temporary folder, then checked like a newly added path and
+  # written by this tool under its proper name. The section name is never used as a file name, so an import
+  # cannot write outside the config folder; the content is parsed, never executed.
+  local tmp line cur="" sec=0 imported=0 skipped=0 f
+  tmp=$(mktemp -d) || { echo "error: cannot create a temporary folder" >&2; return 1; }
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
     if [[ "$line" == "## "*.conf ]]; then
-      current="${PATHS_DIR}/${line#\#\# }"
-      : > "$current"
-      imported=$(( imported + 1 ))
-    elif [ -n "$current" ] && [[ "$line" != "#"* ]]; then
-      echo "$line" >> "$current"
+      sec=$(( sec + 1 )); cur="$tmp/$sec.conf"; : > "$cur"
+    elif [ -n "$cur" ] && [[ "$line" != "#"* ]]; then
+      printf '%s\n' "$line" >> "$cur"
     fi
   done < "$src"
-  chmod 600 "$PATHS_DIR"/*.conf 2>/dev/null
-  echo "Imported ${imported} path config(s) from: $src"
-  log_info "configuration imported from $src (${imported} paths)"
+  for (( f=1; f<=sec; f++ )); do
+    if load_conf "$tmp/$f.conf" 2>/dev/null && check_new_path "$TARGET_PATH" "$PATTERN"; then
+      if with_conf_lock replace_path_conf "$NP_TARGET" "$PATTERN" "$RETENTION_VALUE" "$RETENTION_UNIT" "$ENABLED" "$LAST_PURGE" "$LAST_FREED"; then
+        imported=$(( imported + 1 ))
+      else skipped=$(( skipped + 1 )); fi
+    else
+      skipped=$(( skipped + 1 )); echo "skipped section $f: ${NP_ERR:-invalid or unsafe config}" >&2
+    fi
+  done
+  rm -rf "$tmp"
+  echo "Imported ${imported} path config(s) from: $src$([ "$skipped" -gt 0 ] && echo "  (${skipped} skipped)")"
+  log_info "configuration imported from $src (${imported} paths, ${skipped} skipped)"
+  [ "$skipped" -eq 0 ]
 }
 
 # ============================================================
@@ -1297,27 +1432,41 @@ first_time_setup() {
 
 # det_glob_match <file> <pattern> — bash glob match, returns 0 on match
 # Real path-glob semantics: * and ? stop at '/', ** crosses it (matches fluentd/rsyslog/wazuh/logrotate).
+# "**/" also matches no folder at all (/var/log/**/*.log matches /var/log/app.log, as in fluentd and logrotate),
+# and {a,b} is either alternative.
 det_glob_match() {
-  local f="$1" g="$2" re="" i c n=${#2}
+  local f="$1" g="$2" re="" i c n=${#2} br=0
   [ -n "$g" ] || return 1
   for (( i=0; i<n; i++ )); do
     c="${g:i:1}"
     case "$c" in
-      '*') if [ "${g:i+1:1}" = '*' ]; then re+='.*'; i=$(( i + 1 )); else re+='[^/]*'; fi;;
+      '*') if [ "${g:i+1:1}" = '*' ]; then
+             if [ "${g:i+2:1}" = '/' ]; then re+='(.*/)?'; i=$(( i + 2 )); else re+='.*'; i=$(( i + 1 )); fi
+           else re+='[^/]*'; fi;;
       '?') re+='[^/]';;
       '['|']') re+="$c";;
-      [.+\(\)^$\|{}]) re+="\\$c";;
+      '{') br=$(( br + 1 )); re+='(';;
+      '}') if [ "$br" -gt 0 ]; then br=$(( br - 1 )); re+=')'; else re+='\}'; fi;;
+      ',') if [ "$br" -gt 0 ]; then re+='|'; else re+=','; fi;;
+      [.+\(\)^$\|]) re+="\\$c";;
       *) re+="$c";;
     esac
   done
+  [ "$br" -eq 0 ] || return 1                       # unbalanced braces: not a pattern we can read
   [[ "$f" =~ ^${re}$ ]]
 }
 
 # det_proc_users <file> — one line per process holding the file open:
 #   pid|comm|kind|rw|append|pos     rw: r|w|rw   append: 1|0   kind: rsyslog|fluentd|wazuh|other
 det_proc_users() {
-  local real fd pid n flags pos comm cmd acc app kind rw
+  local real fd pid n flags pos comm cmd acc app kind rw esc
   real=$(readlink -f "$1" 2>/dev/null) || return 0
+  # find -lname takes a glob: a file named like sshd[123].log must be matched literally
+  local _i _ch; esc=""                                  # no fork: called often
+  for (( _i=0; _i<${#real}; _i++ )); do
+    _ch=${real:_i:1}
+    case "$_ch" in '['|'*'|'?'|'\') esc+="\\$_ch";; *) esc+="$_ch";; esac
+  done
   while IFS= read -r fd; do
     pid=${fd#/proc/}; pid=${pid%%/*}; n=${fd##*/}
     flags=$(awk '/^flags:/{print $2}' "/proc/$pid/fdinfo/$n" 2>/dev/null)
@@ -1333,11 +1482,12 @@ det_proc_users() {
       *wazuh-logcollec*)                   kind=wazuh;;
       *)                                   kind=other;;
     esac
+    [ "$comm" = java ] && [[ "$cmd" == *logstash* ]] && comm=logstash      # Logstash runs as "java"
     echo "$pid|$comm|$kind|$rw|$app|${pos:-0}"
   done < <(if [ -n "${DET_BY_INODE:-}" ] || [ "$(stat -c %h "$real" 2>/dev/null || echo 1)" -gt 1 ]; then
              find -L /proc/[0-9]*/fd -maxdepth 1 -samefile "$real" 2>/dev/null     # same inode, any name
            else
-             find /proc/[0-9]*/fd -maxdepth 1 -lname "$real" 2>/dev/null
+             find /proc/[0-9]*/fd -maxdepth 1 -lname "$esc" 2>/dev/null
            fi)
 }
 
@@ -1351,9 +1501,10 @@ det_rsyslog_inputs_raw() {
   local f blk pat re rsf
   mapfile -t rsf < <(list_glob DET_RSYSLOG_FILES)
   for f in ${rsf[@]+"${rsf[@]}"}; do [ -r "$f" ] && grep -vE '^[[:space:]]*#' "$f"; done 2>/dev/null | tr '\n' ' ' \
-    | grep -oiE 'input\([^)]*type="imfile"[^)]*\)' | while IFS= read -r blk; do
-        pat=$(sed -nE 's/.*[Ff][Ii][Ll][Ee]="([^"]+)".*/\1/p' <<<"$blk")
-        if grep -qiE 'reopenOnTruncate="on"' <<<"$blk"; then re=on; else re=off; fi
+    | grep -oiE 'input[[:space:]]*\([^)]*type[[:space:]]*=[[:space:]]*"imfile"[^)]*\)' | while IFS= read -r blk; do
+        # the File= parameter itself — not stateFile= or any other name ending in "file"; spaces around = allowed
+        pat=$(sed -nE 's/.*(^|[^A-Za-z])[Ff][Ii][Ll][Ee][[:space:]]*=[[:space:]]*"([^"]+)".*/\2/p' <<<"$blk")
+        if grep -qiE 'reopenOnTruncate[[:space:]]*=[[:space:]]*"on"' <<<"$blk"; then re=on; else re=off; fi
         [ -n "$pat" ] && echo "$pat|$re"
       done
   for f in ${rsf[@]+"${rsf[@]}"}; do
@@ -1387,8 +1538,11 @@ det_fluentd_confs() {
   local -a argv
   {
     for p in /proc/[0-9]*; do
-      # read the command line with a builtin: one fork per process here cost hundreds of forks per scan
-      mapfile -d '' -t argv < "$p/cmdline" 2>/dev/null || continue
+      # read the command line with builtins: one fork per process here cost hundreds of forks per scan.
+      # (read -d '' rather than mapfile -d, which needs bash 4.4)
+      argv=(); a=""
+      while IFS= read -r -d '' a || [ -n "$a" ]; do argv+=("$a"); a=""; done 2>/dev/null < "$p/cmdline" || true
+      [ "${#argv[@]}" -gt 0 ] || continue
       case "${argv[*]-}" in *fluentd*|*td-agent*) ;; *) continue;; esac
       prev=""
       for a in "${argv[@]}"; do
@@ -1408,26 +1562,41 @@ det_fluentd_confs() {
   return 0
 }
 
-# det_fluentd_sources_raw — "path-pattern|pos_file" for every `@type tail` source
+# det_fluentd_sources_raw — "path-pattern|pos_file|exclude-patterns" for every `@type tail` source.
+# Values may be quoted; strftime placeholders in the path (%Y, %m ...) become *; exclude_path ["a","b"] -> a,b.
 det_fluentd_sources_raw() {
   local c
   det_fluentd_confs | while IFS= read -r c; do
     awk '
-      /<source>/                       { ins=1; t=0; p=""; pf=""; next }
-      ins && /@type[ \t]+tail/         { t=1 }
-      ins && /^[ \t]*path[ \t]/        { sub(/^[ \t]*path[ \t]+/,""); sub(/[ \t]*#.*/,""); sub(/[ \t]+$/,""); p=$0 }
-      ins && /^[ \t]*pos_file[ \t]/    { sub(/^[ \t]*pos_file[ \t]+/,""); sub(/[ \t]*#.*/,""); sub(/[ \t]+$/,""); pf=$0 }
-      /<\/source>/                     { if (ins && t) print p "|" pf; ins=0 }
+      function val(s,  k) { sub(/^[ \t]*[a-z_]+[ \t]+/,"",s); sub(/[ \t]+#.*/,"",s); sub(/[ \t]+$/,"",s); gsub(/"/,"",s); gsub(/\047/,"",s); return s }
+      /<source>/                       { ins=1; t=0; p=""; pf=""; ex=""; next }
+      ins && /@type[ \t]+"?tail"?/     { t=1 }
+      ins && /^[ \t]*path[ \t]/        { p=val($0); gsub(/%[A-Za-z]/,"*",p) }
+      ins && /^[ \t]*pos_file[ \t]/    { pf=val($0) }
+      ins && /^[ \t]*exclude_path[ \t]/ { ex=val($0); gsub(/[\[\] ]/,"",ex) }
+      /<\/source>/                     { if (ins && t) print p "|" pf "|" ex; ins=0 }
     ' "$c" 2>/dev/null
   done | sort -u
 }
 
-# det_fluentd_buffers_raw — directories / files fluentd keeps its buffers in (chunks not yet delivered)
+# det_fluentd_excluded <file> <exclude-list> — 0 if the file matches one of a source's exclude_path patterns
+det_fluentd_excluded() {
+  local one; local -a _ex=()
+  IFS=',' read -r -a _ex <<<"$2"
+  for one in ${_ex[@]+"${_ex[@]}"}; do [ -n "$one" ] && det_glob_match "$1" "$one" && return 0; done
+  return 1
+}
+
+# det_fluentd_buffers_raw — directories / files fluentd keeps its buffers in (chunks not yet delivered):
+# every <buffer> path, and <system> root_dir (where buffers without a path of their own are kept)
 det_fluentd_buffers_raw() {
   local c
   det_fluentd_confs | while IFS= read -r c; do
-    awk '/<buffer/ {inb=1; next} /<\/buffer>/ {inb=0}
-         inb && /^[ \t]*path[ \t]/ { sub(/^[ \t]*path[ \t]+/,""); sub(/[ \t]*#.*/,""); sub(/[ \t]+$/,""); print }' "$c" 2>/dev/null
+    awk 'function val(s) { sub(/^[ \t]*[a-z_]+[ \t]+/,"",s); sub(/[ \t]+#.*/,"",s); sub(/[ \t]+$/,"",s); gsub(/"/,"",s); gsub(/\047/,"",s); return s }
+         /<buffer/ {inb=1; next} /<\/buffer>/ {inb=0}
+         /<system>/ {ins=1; next} /<\/system>/ {ins=0}
+         inb && /^[ \t]*path[ \t]/     { print val($0) }
+         ins && /^[ \t]*root_dir[ \t]/ { print val($0) }' "$c" 2>/dev/null
   done | sort -u
 }
 
@@ -1465,7 +1634,11 @@ pg_protected_file() {
     bp="${bp%%\**}"; bp="${bp%/}"
     if [ -n "$bp" ] && { [ "$f" = "$bp" ] || [[ "$f" == "$bp"* ]]; }; then echo "a fluentd buffer (logs not yet delivered)"; return 0; fi
   done <<<"$bufs"
-  while IFS='|' read -r pos pf; do
+  # a fluentd buffer chunk by its name (buffer.b<32 hex>.log, .q…, and their .meta), wherever it is kept —
+  # also for buffers whose folder is not written in a config this tool can see
+  if [[ "${f##*/}" =~ (^|\.)[bq][0-9a-f]{32}(\.|$) ]]; then echo "a fluentd buffer chunk (logs not yet delivered)"; return 0; fi
+  local _ex
+  while IFS='|' read -r pos pf _ex; do
     [ -n "$pf" ] && [ "$f" = "$pf" ] && { echo "a fluentd position file"; return 0; }
   done < <(det_fluentd_sources)
   return 1
@@ -1480,7 +1653,8 @@ det_wazuh_patterns() {
 # det_wazuh_offset <file> — logcollector's stored read offset (empty if unknown)
 det_wazuh_offset() {
   [ -r "$DET_WAZUH_STATUS" ] || return 0
-  grep -oE "\"path\":\"$1\",\"hash\":\"[0-9a-f]*\",\"offset\":\"[0-9]+\"" "$DET_WAZUH_STATUS" | grep -oE '[0-9]+"$' | tr -d '"'
+  local p; p=$(printf '%s' "$1" | sed 's/[][\.^$*+?(){}|]/\\&/g')     # the path as literal text, not a regex
+  grep -oE "\"path\":\"$p\",\"hash\":\"[0-9a-f]*\",\"offset\":\"[0-9]+\"" "$DET_WAZUH_STATUS" | head -1 | grep -oE '[0-9]+"$' | tr -d '"'
 }
 
 # det_logrotate_manages <file> — 0 if any logrotate stanza covers the file
@@ -1489,8 +1663,17 @@ det_logrotate_manages() {
   mapfile -t lrf < <(list_glob DET_LOGROTATE_FILES)
   for c in ${lrf[@]+"${lrf[@]}"}; do
     [ -f "$c" ] || continue
+    # file names before each "{", also when they are listed one per line above it (the usual rsyslog stanza)
     while IFS= read -r pat; do det_glob_match "$f" "$pat" && return 0; done \
-      < <(grep -vE '^[[:space:]]*#' "$c" | awk '/\{/ { sub(/\{.*/,""); for (i=1;i<=NF;i++) if ($i ~ /^\//) print $i }')
+      < <(awk '
+            { sub(/#.*/,""); s=$0
+              while (length(s)) {
+                if (inb) { p=index(s,"}"); if (!p) { s=""; break }; inb=0; s=substr(s,p+1); continue }
+                p=index(s,"{"); head=(p ? substr(s,1,p-1) : s)
+                n=split(head,a,/[ \t]+/)
+                for (i=1;i<=n;i++) { t=a[i]; gsub(/["\047]/,"",t); if (t ~ /^\//) pend[++k]=t }
+                if (p) { for (i=1;i<=k;i++) print pend[i]; k=0; inb=1; s=substr(s,p+1) } else s=""
+              } }' "$c" 2>/dev/null)
   done
   return 1
 }
@@ -1630,9 +1813,16 @@ det_conflicts_report() {
     n=$(( n + 1 ))
     printf "   %s %s\n      runs: %s\n      does: %s\n" "$(dot "$C_YELLOW")" "${where#*:}" "${cmd:0:160}" "$ops"
   done < <(det_cleanup_jobs)
-  if [ -f "$full" ] && det_logrotate_manages "$full"; then
+  # logrotate: the file itself, or (for a pattern) the first matching files in the folder
+  local lr="" x
+  if [ -f "$full" ]; then det_logrotate_manages "$full" && lr="$full"
+  elif [ -d "$target" ]; then
+    while IFS= read -r -d '' x; do det_logrotate_manages "$x" && { lr="$x"; break; }; done \
+      < <(find "$target" -type f -name "$pattern" -print0 2>/dev/null | head -z -n 20)
+  fi
+  if [ -n "$lr" ]; then
     [ "$n" = 0 ] && echo "${C_YELLOW}warning:${C_RESET} other jobs also clean ${C_BOLD}${full}${C_RESET}:"
-    n=$(( n + 1 )); printf "   %s logrotate is configured for this file\n" "$(dot "$C_YELLOW")"
+    n=$(( n + 1 )); printf "   %s logrotate is configured for %s\n" "$(dot "$C_YELLOW")" "$([ "$lr" = "$full" ] && echo "this file" || echo "$lr")"
   fi
   [ "$n" -gt 0 ] && echo "   ${C_DIM}Disable the other job (or remove this path) so only one of them manages it.${C_RESET}"
   return 0
@@ -1706,12 +1896,12 @@ det_file_report() {
   while IFS= read -r pat; do
     det_glob_match "$f" "$pat" && printf "   config  rsyslog   imfile pattern: %s\n" "$pat"
   done < <(det_rsyslog_patterns)
-  while IFS='|' read -r pat src; do
+  while IFS='|' read -r pat src excl; do
     local p2 one
     IFS=',' read -ra _arr <<<"$pat"
     for one in "${_arr[@]}"; do
       one="${one// /}"
-      if det_glob_match "$f" "$one"; then
+      if det_glob_match "$f" "$one" && ! det_fluentd_excluded "$f" "$excl"; then
         local off=""
         if [ -r "$src" ]; then
           off=$(awk -F'\t' -v p="$f" '$1==p {print $2}' "$src" 2>/dev/null | head -1)
@@ -1757,7 +1947,9 @@ detect_report() {
 # the background watcher never truncate the same file concurrently.
 with_lock() {
   mkdir -p "$CONF_DIR" 2>/dev/null
-  exec 9>"$LOCK_FILE" 2>/dev/null
+  # the braces keep "2>/dev/null" to this one line: a bare "exec 9>f 2>/dev/null" would silence stderr for the
+  # rest of the process (invisible menu prompts, and service errors missing from the journal)
+  { exec 9>"$LOCK_FILE"; } 2>/dev/null
   # PG_LOCK_WAIT>0 (manual purges) waits for a running pass instead of silently skipping it
   if [ "${PG_LOCK_WAIT:-0}" -gt 0 ]; then
     if ! flock -w "$PG_LOCK_WAIT" 9 2>/dev/null; then
@@ -1890,11 +2082,12 @@ pg_consumers_check() {
     done < <(det_rsyslog_patterns)
   fi
   if [ "$have_fl" = 0 ] && [ -z "$PG_BLOCK" ]; then
-    while IFS='|' read -r pat src; do
+    while IFS='|' read -r pat src excl; do
       IFS=',' read -ra _pg_a <<<"$pat"
       for one in "${_pg_a[@]}"; do
         one="${one// /}"
         det_glob_match "$f" "$one" || continue
+        det_fluentd_excluded "$f" "$excl" && continue      # exclude_path: fluentd never reads it
         off=""; local fino="" ino po pi
         # pos_file lines: path<TAB>pos(hex)<TAB>inode(hex). Prefer the entry for this file's inode;
         # an entry for another inode is a position in an older file — it has read none of this one.
@@ -1906,9 +2099,13 @@ pg_consumers_check() {
             [[ "$pi" =~ ^[0-9a-fA-F]+$ ]] && [ -n "$ino" ] && [ "$(( 16#$pi ))" = "$ino" ] && break
           done < <(awk -F'\t' -v p="$f" '$1==p {print $2, $3}' "$src" 2>/dev/null)
         fi
-        if [ "$off" = "ffffffffffffffff" ]; then continue          # fluentd no longer watches it
+        local other_ino=0
+        [[ "$fino" =~ ^[0-9a-fA-F]+$ ]] && [ -n "$ino" ] && [ "$(( 16#$fino ))" != "$ino" ] && other_ino=1
+        # "unwatched" counts only for this very file (same inode). An unwatched entry left by an older file
+        # under the same name says nothing about this one, which fluentd has not read yet.
+        if [ "$off" = "ffffffffffffffff" ] && [ "$other_ino" = 0 ]; then continue    # fluentd no longer watches it
         elif [ -n "$off" ]; then
-          if [[ "$fino" =~ ^[0-9a-fA-F]+$ ]] && [ -n "$ino" ] && [ "$(( 16#$fino ))" != "$ino" ]; then
+          if [ "$other_ino" = 1 ]; then
             lag=$(stat -c %s "$f" 2>/dev/null || echo 0); PG_STALE=1
           else
             pg_lag_of "$f" $(( 16#$off )); lag=$PG_LAG
@@ -1972,12 +2169,13 @@ pg_finished_file_check() {
   done < <(DET_BY_INODE=1 det_proc_users "$f")     # by inode: also readers that opened it under a removed name
   # saved positions: fluentd may have read data into memory that it has not processed yet
   ino=$(stat -c %i "$f" 2>/dev/null)
-  while IFS='|' read -r pat src; do
+  while IFS='|' read -r pat src excl; do
     [ -r "$src" ] || continue
     IFS=',' read -ra _pf_a <<<"$pat"
     for one in "${_pf_a[@]}"; do
       one="${one// /}"
       det_glob_match "$f" "$one" || continue
+      det_fluentd_excluded "$f" "$excl" && continue
       while read -r po pi; do
         [[ "$po" =~ ^[0-9a-fA-F]+$ ]] || continue
         [ "$po" = "ffffffffffffffff" ] && continue
@@ -2064,6 +2262,7 @@ pg_readers_drain() {
 #                                    already read it see those lines twice: duplicates, never loss.
 # A copy is never deleted while its watch record is open, nor while any process holds it open.
 PG_WATCH_DIR="/var/lib/purging-console/watch"
+PG_PENDING_DIR="/var/lib/purging-console/pending"   # per path: live files deferred and retried every pass
 
 # pg_pid_start <pid> — process start time (field 22 of /proc/<pid>/stat); tells a restarted pid apart
 pg_pid_start() {
@@ -2157,18 +2356,23 @@ pg_watch_tick() {
     rm -f "$rec"; return 0
   fi
   size=$(stat -c %s "$PG_W_COPY")
+  # A writer that has not reopened yet (rsyslog handles its HUP a moment later) can still add lines to the
+  # copy. While one does, "the reader reached the end" is not final: keep watching, and replay only after the
+  # writer has let go, so the replay covers its last lines too.
+  local wr=0
   while IFS='|' read -r pid comm k rw app pos; do
-    [ "$rw" = "r" ] || continue
+    [ -n "$pid" ] || continue
+    if [ "$rw" != "r" ]; then wr=1; continue; fi
     if [ -z "${hp[$pid]:-}" ] || [ "$pos" -gt "${hp[$pid]}" ]; then hp[$pid]=$pos; fi
-  done < <(det_proc_users "$PG_W_COPY")
+  done < <(DET_BY_INODE=1 det_proc_users "$PG_W_COPY")
   for i in "${!PG_W_ROWS[@]}"; do
     IFS='|' read -r k pid st comm off state <<<"${PG_W_ROWS[$i]}"
     if [ "$state" = "watching" ]; then
       alive=0; [ "$(pg_pid_start "$pid" 2>/dev/null)" = "$st" ] && alive=1
       if [ "$alive" = 1 ] && [ -n "${hp[$pid]:-}" ]; then
         [ "${hp[$pid]}" -gt "$off" ] && off=${hp[$pid]}
-        [ "$off" -ge "$size" ] && state=done
-      elif [ "$off" -ge "$size" ]; then
+        [ "$off" -ge "$size" ] && [ "$wr" = 0 ] && state=done
+      elif [ "$off" -ge "$size" ] && [ "$wr" = 0 ]; then
         state=done
       else
         state=abandoned
@@ -2178,7 +2382,7 @@ pg_watch_tick() {
     fi
     if [ "$state" = "abandoned" ] && { [ "$minoff" -lt 0 ] || [ "$off" -lt "$minoff" ]; }; then minoff=$off; fi
   done
-  if [ "$minoff" -ge 0 ]; then
+  if [ "$minoff" -ge 0 ] && [ "$wr" = 0 ]; then     # replay once no writer adds to the copy any more
     PG_REPLAYED=0
     if pg_replay "$PG_W_COPY" "$PG_W_LIVE" "$minoff"; then
       log_success "watch: replayed $(human "$PG_REPLAYED") of unread data from $PG_W_COPY into $PG_W_LIVE"
@@ -2247,9 +2451,12 @@ pg_do_rotate() {
     sleep 0.2; t=$(( t + 1 ))
   done
   if [ "$held" -gt 0 ]; then
-    # a writer is still appending to the renamed file: put things back if nothing new landed
-    if [ ! -s "$f" ]; then mv -f -- "$dest" "$f" && rm -f "$(pg_watch_rec "$dest")" && PG_WHY="writer did not reopen after reload — rotation rolled back"
-    else PG_WHY="writer still on $dest after reload and new file already has data — left in place"; fi
+    # a writer is still appending to the renamed file: put things back if nothing new landed and nobody has
+    # opened the new file yet (replacing a file another process already writes would leave it writing into
+    # a deleted file)
+    if [ ! -s "$f" ] && [ -z "$(det_proc_users "$f")" ]; then
+      mv -f -- "$dest" "$f" && rm -f "$(pg_watch_rec "$dest")" && PG_WHY="writer did not reopen after reload — rotation rolled back"
+    else PG_WHY="writer still on $dest after reload while the new file is already in use — left in place"; fi
     log_error "$PG_WHY ($f)"
     return 1
   fi
@@ -2295,6 +2502,12 @@ pg_process_file() {
   sz=$(stat -c %s "$f" 2>/dev/null || echo 0); base="${f##*/}"; now=$(date +%s)
   mins=$(unit_to_min "$RETENTION_VALUE" "$RETENTION_UNIT")
   pg_old_name "$base" && old=1
+  # In size / daily mode a date-named file (firewall_20261120.log) that a process still writes is today's live
+  # file, not a finished one: without this it was never rotated and its size limit never applied.
+  if [ "$old" = 1 ] && [ "$RETENTION_UNIT" = "mb" -o "$RETENTION_UNIT" = "midnight" ] \
+     && ! pg_rotated_name "$base" && pg_dated_name "$base"; then
+    pg_writers_check "$f"; [ "$PG_WRITERS" -gt 0 ] && old=0
+  fi
   if [ "$force" != "force" ] && [ "${PG_NEXT_TRY[$f]:-0}" -gt "$now" ]; then
     PG_OUTCOME="skipped"
     [ "$old" = 1 ] || PG_LIVE="pending"    # a backed-off live file is still unhandled
@@ -2426,9 +2639,14 @@ pg_process_file() {
 # Processes a single configured path independently — a failure here never
 # aborts processing of the remaining configured paths.
 purge_one_path() {
-  local f="$1" verbose="$2" force="$3" dry="$4"
+  local f="$1" verbose="$2" force="$3" dry="$4" why
   load_conf "$f" || { log_error "skip (corrupted config): $f"; return 1; }
   [ "$ENABLED" = "1" ] || return 0
+  # checked again on every pass: an older or hand-edited conf, or a protection added in the settings later
+  if ! why=$(safe_target "$TARGET_PATH"); then
+    if [ "${PG_SKIP_SEEN[unsafe:$f]:-}" != "$why" ]; then PG_SKIP_SEEN["unsafe:$f"]="$why"; log_error "skip $TARGET_PATH (not managed): $why"; fi
+    return 0
+  fi
   if [ ! -d "$TARGET_PATH" ]; then
     if [ -z "${PG_SKIP_SEEN[missing:$TARGET_PATH]:-}" ]; then
       PG_SKIP_SEEN["missing:$TARGET_PATH"]=1; log_warn "skip (folder does not exist; reported once): $TARGET_PATH"
@@ -2448,12 +2666,27 @@ purge_one_path() {
   id=$(path_id "${TARGET_PATH}/${PATTERN}")
   now_epoch=$(date +%s); last_purge_epoch=${LAST_PURGE:-0}
 
+  # Live files that were due but had to be deferred (a reader behind, a writer that did not reopen ...) are
+  # remembered one by one and retried every pass until handled. The path's interval restarts on schedule, so
+  # one stuck file can no longer make every other file in the folder rotate on every pass.
+  declare -A pend=() pend_new=()
+  local pend_file="$PG_PENDING_DIR/$id.list" pl
+  if [ "$RETENTION_UNIT" != "mb" ] && [ -r "$pend_file" ]; then
+    while IFS= read -r -d '' pl; do [ -n "$pl" ] && pend[$pl]=1; done < "$pend_file"
+  fi
+
   if [ "$RETENTION_UNIT" = "mb" ]; then
     threshold_bytes=$(( RETENTION_VALUE * 1024 * 1024 ))
   elif [ "$RETENTION_UNIT" = "midnight" ]; then
     # daily mode: due once the most recent daily rotation time (setting PG_DAILY_AT) has passed since the last run
-    local boundary
-    boundary=$(date -d "$(date +%F) ${PG_DAILY_AT:0:2}:${PG_DAILY_AT:2:2}" +%s 2>/dev/null || echo "$now_epoch")
+    local boundary noon
+    boundary=$(date -d "$(date +%F) ${PG_DAILY_AT:0:2}:${PG_DAILY_AT:2:2}" +%s 2>/dev/null)
+    if [ -z "$boundary" ]; then
+      # that time does not exist today (skipped by a daylight-saving change): count from noon instead of
+      # falling back to "now", which made the path due on every pass for the whole day
+      noon=$(date -d "$(date +%F) 12:00" +%s)
+      boundary=$(( noon - 43200 + 10#${PG_DAILY_AT:0:2} * 3600 + 10#${PG_DAILY_AT:2:2} * 60 ))
+    fi
     [ "$now_epoch" -lt "$boundary" ] && boundary=$(( boundary - 86400 ))
     [ "$last_purge_epoch" -lt "$boundary" ] && due=1
   else
@@ -2487,12 +2720,14 @@ purge_one_path() {
     if [ "$RETENTION_UNIT" = "mb" ]; then
       sz=$(stat -c %s "$file" 2>/dev/null || echo 0)
       if [ "$sz" -gt "$threshold_bytes" ] || { [ "$force" = "force" ] && [ "$sz" -gt 0 ]; }; then file_due=1; else file_due=0; fi
+    elif [ -n "${pend[$file]:-}" ]; then
+      file_due=1                                    # deferred earlier: still due until it is handled
     fi
     pg_process_file "$file" "$file_due" "$dry" "$verbose" "$force"
     freed=$(( freed + PG_FREED ))
     [ "$PG_OUTCOME" = "acted" ] && acted=$(( acted + 1 ))
     [ "$PG_LIVE" = "acted" ]   && live_acted=1
-    [ "$PG_LIVE" = "pending" ] && live_pending=1
+    [ "$PG_LIVE" = "pending" ] && { live_pending=1; [ "$file_due" = "1" ] && pend_new[$file]=1; }
   done
 
   if [ "$dry" = "1" ]; then
@@ -2501,20 +2736,41 @@ purge_one_path() {
     return 0
   fi
 
-  # Schedule bookkeeping: time-based paths restart their interval once every due live file is handled
-  # (or there was nothing to do); anything we had to defer stays due and is retried after the back-off.
+  # Schedule bookkeeping: a time-based path restarts its interval whenever it was due. Files that had to be
+  # deferred are in the pending list and retried on their own — they no longer keep the whole path due.
   new_lp=$LAST_PURGE
   if [ "$RETENTION_UNIT" = "mb" ]; then
     [ "$live_acted" = "1" ] && new_lp=$now_epoch
   else
-    [ "$due" = "1" ] && [ "$live_pending" = "0" ] && new_lp=$now_epoch
+    [ "$due" = "1" ] && new_lp=$now_epoch
   fi
-  if [ "$new_lp" != "$LAST_PURGE" ] || [ "$freed" -gt 0 ]; then
-    write_conf "$id" "$TARGET_PATH" "$PATTERN" "$RETENTION_VALUE" "$RETENTION_UNIT" "$ENABLED" "$new_lp" \
-      "$([ "$freed" -gt 0 ] && echo "$freed" || echo "$LAST_FREED")"
+  if [ "$new_lp" != "$LAST_PURGE" ] || [ "$freed" -gt 0 ] || [ "$f" != "$PATHS_DIR/$id.conf" ]; then
+    ( with_conf_lock conf_update_run "$f" "$id" "$TARGET_PATH" "$PATTERN" "$new_lp" \
+        "$([ "$freed" -gt 0 ] && echo "$freed" || echo "$LAST_FREED")" )
+  fi
+  # remember the live files that are still waiting (retried every pass, see above)
+  if [ "$RETENTION_UNIT" != "mb" ]; then
+    if [ "${#pend_new[@]}" -gt 0 ]; then
+      mkdir -p "$PG_PENDING_DIR" 2>/dev/null && chmod 700 "$PG_PENDING_DIR" 2>/dev/null
+      printf '%s\0' "${!pend_new[@]}" > "$pend_file.tmp.$$" && mv -f "$pend_file.tmp.$$" "$pend_file"
+    else
+      rm -f "$pend_file"
+    fi
   fi
   [ "$freed" -gt 0 ] && log_success "reclaimed $(human "$freed") in $TARGET_PATH (${RETENTION_VALUE}${RETENTION_UNIT})"
   return 0
+}
+
+# conf_update_run <conf file> <id> <target> <pattern> <last_purge> <last_freed> — the service's write-back after
+# a pass. It re-reads the conf (under with_conf_lock) and changes only the two bookkeeping values, so a path that
+# was removed, disabled or edited from the console while the pass ran keeps that change. A conf whose file
+# name is not the id of its target+pattern is moved to the right name (otherwise it would be due on every pass).
+conf_update_run() {
+  local f="$1" id="$2" t0="$3" p0="$4" lp="$5" lf="$6"
+  [ -e "$f" ] || return 0                                            # removed meanwhile
+  load_conf "$f" || return 0
+  { [ "$TARGET_PATH" = "$t0" ] && [ "$PATTERN" = "$p0" ]; } || return 0  # edited meanwhile: leave it alone
+  rewrite_path_conf "$f" "$id" "$TARGET_PATH" "$PATTERN" "$RETENTION_VALUE" "$RETENTION_UNIT" "$ENABLED" "$lp" "$lf"
 }
 
 # do_worker [verbose] [force] [dry_run]
@@ -2561,8 +2817,13 @@ settings_edit() {
       read -rp "Choose: " ans
       case "$ans" in
         a|A) read -rp "New item: " item; [ -n "$item" ] || continue
-             if msg=$(settings_set "$key" "${!key:+${!key}|}$item"); then success_msg "Added."; else error_msg "$msg"; fi; pause;;
+             settings_reload_if_changed          # add to the list as it is on disk now, not as it was shown
+             # settings_set runs in a subshell here (to capture its message), so reload its result into this shell
+             if msg=$(settings_set "$key" "${!key:+${!key}|}$item"); then settings_load; success_msg "Added."; else error_msg "$msg"; fi; pause;;
         d|D) read -rp "Delete item number: " ans
+             if [ "$(stat -c '%y %i' "$SETTINGS_FILE" 2>/dev/null)" != "$SETTINGS_MTIME" ]; then
+               settings_load; error_msg "The settings were changed elsewhere meanwhile — check the list again."; pause; continue
+             fi
              if [[ "$ans" =~ ^[0-9]+$ ]] && [ -n "${items[$ans]:-}" ]; then
                local keep="" j; for (( j=1; j<=i; j++ )); do [ "$j" = "$ans" ] || keep+="${keep:+|}${items[$j]}"; done
                if [ -z "$keep" ] && [ -n "$def" ]; then
@@ -2587,7 +2848,8 @@ settings_edit() {
       esac
       read -rp "New value (Enter = keep, 'default' = reset): " ans
       [ -n "$ans" ] || return
-      if msg=$(settings_set "$key" "$ans"); then success_msg "Saved: $(settings_show "$key")"; else error_msg "$msg"; fi
+      # settings_set runs in a subshell here (to capture its message), so reload its result into this shell
+      if msg=$(settings_set "$key" "$ans"); then settings_load; success_msg "Saved: $(settings_show "$key")"; else error_msg "$msg"; fi
       pause; return
     fi
   done
@@ -2632,6 +2894,7 @@ path_options_prompt() {
 
 main_menu() {
   while true; do
+    settings_reload_if_changed     # pick up a --set or another console's change before showing anything
     dashboard
     echo
     hr "-"
@@ -2755,10 +3018,10 @@ plan_who() {
   while IFS= read -r pat; do
     det_glob_match "$f" "$pat" && [[ "$r" != *rsyslog* ]] && r+="${r:+, }rsyslog imfile (configured, not reading now)"
   done < <(det_rsyslog_patterns)
-  while IFS='|' read -r pat src; do
+  while IFS='|' read -r pat src excl; do
     IFS=',' read -ra _pw_a <<<"$pat"
     for one in "${_pw_a[@]}"; do
-      one="${one// /}"; det_glob_match "$f" "$one" || continue
+      one="${one// /}"; det_glob_match "$f" "$one" || continue; det_fluentd_excluded "$f" "$excl" && continue
       [[ "$r" == *fluentd* ]] || r+="${r:+, }fluentd (configured; position file ${src##*/})"
       break
     done
@@ -2852,10 +3115,12 @@ cmd_remove() {
   arg="${arg%/}"
   if [ -d "$arg" ]; then target="$arg"; pattern="*"
   else target=$(dirname "$arg"); pattern=$(basename "$arg"); fi
+  local ctarget carg; ctarget=$(realpath -m -- "$target" 2>/dev/null || echo "$target"); carg=$(realpath -m -- "$arg" 2>/dev/null || echo "$arg")
   for f in $(list_confs); do
     load_conf "$f" >/dev/null 2>&1 || continue
-    if { [ "$TARGET_PATH" = "$target" ] && [ "$PATTERN" = "$pattern" ]; } || { [ "$TARGET_PATH" = "$arg" ] && [ "$PATTERN" = "*" ]; }; then
-      rm -f "$f"; n=$(( n + 1 ))
+    if { { [ "$TARGET_PATH" = "$target" ] || [ "$TARGET_PATH" = "$ctarget" ]; } && [ "$PATTERN" = "$pattern" ]; } \
+       || { { [ "$TARGET_PATH" = "$arg" ] || [ "$TARGET_PATH" = "$carg" ]; } && [ "$PATTERN" = "*" ]; }; then
+      with_conf_lock rm -f "$f"; n=$(( n + 1 ))
       echo "Removed from management: ${TARGET_PATH}  (pattern: ${PATTERN})  — no files were touched"
       log_info "CLI remove: ${TARGET_PATH}/${PATTERN}"
     fi
@@ -2906,17 +3171,18 @@ cmd_add() {
     if [[ "$base" == *.* ]]; then pattern="$base"; target=$(dirname "$target")
     else pattern="*"; fi
   fi
+  # check the folder that will really be searched, not just what was typed ("/*.log" would be all of /)
+  check_new_path "$target" "$pattern" || die "$NP_ERR"
+  target=$NP_TARGET
 
   mkdir -p "$PATHS_DIR"; chmod 700 "$CONF_DIR" "$PATHS_DIR" 2>/dev/null
-
-  local existing; existing=$(find_conf_by_target_pattern "$target" "$pattern") && rm -f "$existing"
 
   local id; id=$(path_id "${target}/${pattern}")
   local display_path initial_lp=0
   [ "$unit" = "midnight" ] && initial_lp=$(date +%s)
   if [[ "$pattern" != *"*"* ]]; then display_path="${target}/${pattern}"; else display_path="${target}  (pattern: ${pattern})"; fi
   HOLD_SEC="$hold"; PATH_ALLOW_TRUNCATE="$trunc"
-  if write_conf "$id" "$target" "$pattern" "$value" "$unit" 1 "$initial_lp" 0; then
+  if with_conf_lock replace_path_conf "$target" "$pattern" "$value" "$unit" 1 "$initial_lp" 0; then
     echo "Added: '${display_path}'  →  retain last ${value} ${unit}${hold:+, rotated copies held $(human_secs "$hold")}"
     log_info "CLI add: ${target}/${pattern} retention=${value}${unit}${hold:+ hold=${hold}s}"
     load_conf "$PATHS_DIR/$id.conf" >/dev/null 2>&1 && path_plan "$target" "$pattern"
