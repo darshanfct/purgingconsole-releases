@@ -26,7 +26,7 @@ set -u
 # SECTION: Constants & Global State
 # ============================================================
 readonly APP_NAME="Purging Management Console"
-readonly APP_VERSION="2.6.8"
+readonly APP_VERSION="2.6.9"
 readonly CONFIG_SCHEMA_VERSION=2
 readonly CONF_DIR="/etc/darshan/purging"
 readonly PATHS_DIR="${CONF_DIR}/paths.d"
@@ -2570,6 +2570,27 @@ pg_process_file() {
   pg_consumers_check "$f"
   if [ -n "$PG_BLOCK" ]; then pg_skip "$f" "$PG_BLOCK"; PG_OUTCOME="deferred"; PG_LIVE="pending"; return 0; fi
   pg_writers_check "$f"
+  if [ "$PG_WRITERS" -eq 0 ]; then
+    # Holds nobody, but written within the last minute: most likely its writer was just told to reopen. rsyslog
+    # closes ALL its files on the HUP sent when the previous file of this pass was rotated, and opens each again
+    # on its next write. Deciding "nobody writes it" at that moment left busy files unrotated for a day
+    # (seen on a log receiver, v2.6.7). Wait for the writer to come back first.
+    local mt w=0; mt=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+    if [ $(( now - mt )) -lt 60 ]; then
+      while [ "$w" -lt "$PG_VERIFY_SEC" ] && [ "$PG_WRITERS" -eq 0 ]; do sleep 1; w=$(( w + 1 )); pg_writers_check "$f"; done
+      if [ "$PG_WRITERS" -eq 0 ]; then
+        case "$RETENTION_UNIT" in
+          hours|days|weeks|months)
+            # a writer that opens the file for every write and closes it again: time mode waits for it to go quiet
+            pg_skip "$f" "it is being written, but no process keeps it open (a writer that opens it for each write) — a time-based path waits until it has been unwritten for ${RETENTION_VALUE} ${RETENTION_UNIT}; use size (e.g. 500mb) or midnight mode for such a file"
+            PG_OUTCOME="deferred"; PG_LIVE="acted"; return 0;;
+        esac
+      else
+        pg_consumers_check "$f"                     # the writer is back: take a fresh look at the readers too
+        if [ -n "$PG_BLOCK" ]; then pg_skip "$f" "$PG_BLOCK"; PG_OUTCOME="deferred"; PG_LIVE="pending"; return 0; fi
+      fi
+    fi
+  fi
   if   [ "$PG_WRITERS" -eq 0 ];      then
     # Nobody is writing it. Time-based retention: once it is older than the retention, set it aside as
     # <file>.purge-<epoch> (no empty stand-in is created) — held like any rotated copy, then deleted.
