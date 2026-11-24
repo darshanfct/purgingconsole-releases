@@ -1,6 +1,10 @@
-# client inventory (names, server addresses, notes) — kept local, never in the repo
+# client inventory (names, server addresses, notes) and test / survey scripts that name clients —
+# kept local, never in this public repo
 clients.json
 archive/
+tests/
+tools/*
+!tools/build-installer.sh
 # local scratch
 tmp_dbg/
 *.tar.gz

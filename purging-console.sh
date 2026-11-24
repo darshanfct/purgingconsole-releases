@@ -26,7 +26,7 @@ set -u
 # SECTION: Constants & Global State
 # ============================================================
 readonly APP_NAME="Purging Management Console"
-readonly APP_VERSION="2.6.10"
+readonly APP_VERSION="2.6.11"
 readonly CONFIG_SCHEMA_VERSION=2
 readonly CONF_DIR="/etc/darshan/purging"
 readonly PATHS_DIR="${CONF_DIR}/paths.d"
@@ -56,9 +56,9 @@ readonly PG_PROTECT_FLOOR=( "/" "/etc" "/usr" "/bin" "/sbin" "/lib" "/lib64" "/b
 
 # KEY <tab> type <tab> default <tab> group <tab> label      (list values: items separated by |)
 # types: dur (30s/15m/2h/1d)  pct  bool  size (64MB/1GB)  hhmm (23:55)  path  list:path  list:name  list:regex
-#        dirname (a folder name, or off)  copyname (copy-name format: {name} {ext} + date codes)
+#        dirname (a folder name, or off)  copyname (copy-name format: {name} {ext} + date codes)  url (https://…)
 SETTINGS_REGISTRY=$(cat <<'REG'
-PG_GRACE_SEC	dur	86400	Rotation	Hold each rotated copy this long, then delete it (paths can override)
+PG_GRACE_SEC	dur	3600	Rotation	Hold each rotated copy this long, then delete it (paths can override)
 PG_DISK_EMERGENCY_PCT	pct	90	Rotation	Disk use at which a fully-read copy may go before its hold ends
 PG_COPY_DIR	dirname	purged	Rotation	Folder (inside the log's own folder) that holds the rotated copies; off = keep them beside the log
 PG_COPY_NAME	copyname	{name}_delete-at_%d-%b-%Y_at_%I-%M-%S-%p-%Z{ext}	Rotation	Name of a rotated copy: {name} {ext} and date codes (%d %b %Y %I %M %S %p %Z) for its delete time
@@ -92,6 +92,9 @@ PG_ROTATED_EXTRA	list:regex		File names	Extra regex for already-rotated file nam
 PG_DATED_EXTRA	list:regex		File names	Extra regex for date-named file names (besides 20261029 / 2026-10-29)
 PG_HELD_ROOTS	list:path	/var/log|/var/ossec/logs|/opt|/data|/srv|/home/*/*	Reports	Folders checked for deleted-but-still-open files
 PG_HELD_SKIP	list:name	*/.cache/*|*/.mozilla/*|*/snap/*|*.sqlite*|*/.vscode-server/*	Reports	Paths skipped in that check
+PG_UPDATE_URL	url	https://raw.githubusercontent.com/darshanfct/purgingconsole-releases/main	Update	Where --update looks for new versions (the raw files of the releases repo: purging-console.sh, CHANGELOG.md)
+PG_AUTO_UPDATE	bool	0	Update	Install newer versions by itself once a day (off: only when you run --update)
+PG_AUTO_UPDATE_AT	hhmm	0300	Update	Time of day for the automatic update check (server time)
 REG
 )
 declare -A SETTINGS_ENV=() SETTINGS_FROM=()
@@ -118,14 +121,16 @@ settings_normalize() {
           # the service loop and the writer check need a real interval: 0 would spin a CPU core
           case "$key" in PG_TICK_SEC|PG_PASS_SEC|PG_VERIFY_SEC) [ "$v" -ge 1 ] || { echo "use at least 1s"; return 1; };; esac
           echo "$v";;
-    pct)  v="${raw%\%}"; [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] && [ "$v" -le 100 ] || { echo "use a percentage from 1 to 100"; return 1; }; echo "$v";;
+    pct)  v="${raw%\%}"; [[ "$v" =~ ^[0-9]{1,3}$ ]] && v=$(( 10#$v )) && [ "$v" -ge 1 ] && [ "$v" -le 100 ] || { echo "use a percentage from 1 to 100"; return 1; }; echo "$v";;
     bool) case "${raw,,}" in on|yes|1|true|enable|enabled) echo 1;; off|no|0|false|disable|disabled) echo 0;; *) echo "use on or off"; return 1;; esac;;
     size) [[ "${raw^^}" =~ ^([0-9]+)[[:space:]]*(B|K|KB|M|MB|G|GB)?$ ]] || { echo "use a size like 64MB or 1GB"; return 1; }
-          n=${BASH_REMATCH[1]}
+          n=$(( 10#${BASH_REMATCH[1]} ))       # 10#: "08" is eight, not a bad octal number that stops the script
           case "${BASH_REMATCH[2]}" in K|KB) n=$(( n * 1024 ));; M|MB) n=$(( n * 1048576 ));; G|GB) n=$(( n * 1073741824 ));; esac
           echo "$n";;
     hhmm) [[ "$raw" =~ ^([01]?[0-9]|2[0-3]):?([0-5][0-9])$ ]] || { echo "use a time of day like 23:55"; return 1; }
           printf '%02d%02d\n' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[2]}))";;
+    url)  [[ "$raw" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~%/+-]*)?$ ]] || { echo "use an https:// address (no spaces or quotes)"; return 1; }
+          echo "${raw%/}";;
     path) [[ "$raw" = /* ]] || { echo "use an absolute path"; return 1; }
           [[ "$raw" == *[\"$'\n\r']* ]] && { echo "the path contains a quote or a line break"; return 1; }
           echo "$raw";;
@@ -317,6 +322,9 @@ log_success() { log "SUCCESS" "$*"; }
 # SECTION: Generic Helpers
 # ============================================================
 pause() { echo; read -rp "${C_DIM}Press Enter to continue...${C_RESET}" _; }
+# menu_eof — a menu prompt got no input at all (no terminal: cron, a pipe that ran out): stop instead of
+# printing "Invalid choice" forever
+menu_eof() { echo; echo "no more input — leaving the menu" >&2; exit 0; }
 
 confirm() {
   local prompt="${1:-Are you sure?}" ans
@@ -353,6 +361,7 @@ rel_time() {
 
 unit_to_min() {  # <value> <unit>  ->  minutes (mb: raw value passed through)
   local v=$1 u=$2
+  [[ "$v" =~ ^[0-9]+$ ]] && v=$(( 10#$v )) || v=0
   case "$u" in
     hours)  echo $(( v * 60 ));;
     days)   echo $(( v * 1440 ));;
@@ -371,18 +380,21 @@ path_id() { printf '%s' "$1" | sha1sum | cut -c1-12; }
 # parse_retention "7d" -> "7 days"  |  "2h" -> "2 hours"  |  "3w" -> "3 weeks"  |  "1m" -> "1 months"
 parse_retention() {
   local ret="$1"
-  if [[ "$ret" =~ ^([0-9]+)(h|d|w|m)$ ]]; then
-    local v="${BASH_REMATCH[1]}" s="${BASH_REMATCH[2]}" u
+  # numbers are read as decimal (10#): bash would take "08" as a bad octal number and stop the script, and
+  # "010" as eight. 0 is refused: a path with retention 0 would rotate / delete on every pass.
+  if [[ "$ret" =~ ^([0-9]{1,9})(h|d|w|m)$ ]]; then
+    local v=$(( 10#${BASH_REMATCH[1]} )) s="${BASH_REMATCH[2]}" u
+    [ "$v" -ge 1 ] || return 1
     case "$s" in h) u="hours";; d) u="days";; w) u="weeks";; m) u="months";; esac
     echo "$v $u"; return 0
   fi
   case "$ret" in midnight|daily|@00:00) echo "1 midnight"; return 0;; esac          # rotate once a day (at setting PG_DAILY_AT)
-  if [[ "$ret" =~ ^([0-9]+)(mb|MB|M)$ ]]; then echo "${BASH_REMATCH[1]} mb"; return 0; fi  # rotate above N MB
+  if [[ "$ret" =~ ^([0-9]{1,9})(mb|MB|M)$ ]] && [ $(( 10#${BASH_REMATCH[1]} )) -ge 1 ]; then echo "$(( 10#${BASH_REMATCH[1]} )) mb"; return 0; fi  # rotate above N MB
   return 1
 }
 
 # is_positive_int <value> -> validates a whole number >= 1
-is_positive_int() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ]; }
+is_positive_int() { [[ "$1" =~ ^[0-9]{1,9}$ ]] && [ $(( 10#$1 )) -ge 1 ]; }   # callers store $(( 10#value ))
 
 require_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -469,7 +481,7 @@ validate_conf_values() {
   [ "${target%/}" != "" ] || { echo "TARGET_PATH is the whole disk (/)"; return 1; }
   [[ "$target" == *[\"$'\n\r']* ]] && { echo "TARGET_PATH contains a quote or line break"; return 1; }
   safe_pattern "$pattern" >/dev/null || { echo "PATTERN not allowed: '$pattern'"; return 1; }
-  [[ "$value" =~ ^[0-9]+$ ]] || { echo "RETENTION_VALUE not numeric: '$value'"; return 1; }
+  [[ "$value" =~ ^[1-9][0-9]{0,8}$ ]] || { echo "RETENTION_VALUE must be a whole number 1 or more: '$value'"; return 1; }
   case "$unit" in hours|days|weeks|months|mb|midnight) ;; *) echo "unknown RETENTION_UNIT: '$unit'"; return 1;; esac
   [[ "$enabled" =~ ^[01]$ ]] || { echo "ENABLED must be 0 or 1: '$enabled'"; return 1; }
   return 0
@@ -549,12 +561,15 @@ load_conf() {
     case "$k" in
       TARGET_PATH|PATTERN|RETENTION_UNIT) printf -v "$k" '%s' "$v";;
       RETENTION_VALUE|ENABLED|HOLD_SEC|PATH_ALLOW_TRUNCATE) printf -v "$k" '%s' "$v";;   # checked below
-      SCHEMA_VERSION|LAST_PURGE|LAST_FREED) [[ "$v" =~ ^[0-9]+$ ]] && printf -v "$k" '%s' "$v";;   # numbers only
+      SCHEMA_VERSION|LAST_PURGE|LAST_FREED) [[ "$v" =~ ^[0-9]{1,18}$ ]] && printf -v "$k" '%s' "$(( 10#$v ))";;   # numbers only, decimal
     esac
   done < "$f"
-  if [ -n "$HOLD_SEC" ] && ! [[ "$HOLD_SEC" =~ ^[0-9]+$ ]]; then
+  if [ -n "$HOLD_SEC" ] && ! [[ "$HOLD_SEC" =~ ^[0-9]{1,12}$ ]]; then
     log_error "config has an invalid HOLD_SEC ('$HOLD_SEC'), skipping: $f"; return 1
   fi
+  # decimal: a "08" (hand-edited or imported) must not be read as octal later — that stops the script
+  [ -n "$HOLD_SEC" ] && HOLD_SEC=$(( 10#$HOLD_SEC ))
+  [[ "$RETENTION_VALUE" =~ ^[0-9]{1,9}$ ]] && RETENTION_VALUE=$(( 10#$RETENTION_VALUE ))
   if [ -n "$PATH_ALLOW_TRUNCATE" ] && ! [[ "$PATH_ALLOW_TRUNCATE" =~ ^[01]$ ]]; then
     log_error "config has an invalid PATH_ALLOW_TRUNCATE ('$PATH_ALLOW_TRUNCATE'), skipping: $f"; return 1
   fi
@@ -767,7 +782,8 @@ dashboard() {
 # Build an index -> conf-file map and echo the file for a given menu number
 conf_by_index() {
   local want="$1" i=0 f
-  [[ "$want" =~ ^[0-9]+$ ]] || return 1
+  [[ "$want" =~ ^[0-9]{1,9}$ ]] || return 1
+  want=$(( 10#$want ))
   for f in $(list_confs); do
     i=$(( i + 1 ))
     if [ "$i" = "$want" ]; then echo "$f"; return 0; fi
@@ -793,7 +809,7 @@ pick_duration() {  # pick_duration <path> <pattern>
     echo "  ${C_CYAN}6${C_RESET}) Size (MB threshold — rotate when file exceeds X MB)"
     echo "  ${C_CYAN}7${C_RESET}) Schedule — every 24h elapsed  ${C_DIM}OR${C_RESET}  once a day at the daily time (${PG_DAILY_AT:0:2}:${PG_DAILY_AT:2:2}, setting PG_DAILY_AT)"
     echo "  ${C_CYAN}0${C_RESET}) Cancel"
-    read -rp "Choose unit: " choice
+    read -rp "Choose unit: " choice || menu_eof
     case "$choice" in
       1) unit="hours";;
       2) unit="days";;
@@ -801,7 +817,7 @@ pick_duration() {  # pick_duration <path> <pattern>
       4) unit="months";;
       5)
         echo "  ${C_CYAN}a${C_RESET}) Daily (1 day)   ${C_CYAN}b${C_RESET}) Weekly (7 days)   ${C_CYAN}c${C_RESET}) Monthly (30 days)"
-        read -rp "Preset: " p
+        read -rp "Preset: " p || menu_eof
         case "$p" in a) value=1; unit=days;; b) value=7; unit=days;; c) value=30; unit=days;; *) continue;; esac
         ;;
       6) unit="mb";;
@@ -809,7 +825,7 @@ pick_duration() {  # pick_duration <path> <pattern>
         echo
         echo "  ${C_CYAN}a${C_RESET}) Every 24 hours elapsed since last purge"
         echo "  ${C_CYAN}b${C_RESET}) Once per day at ${PG_DAILY_AT:0:2}:${PG_DAILY_AT:2:2} (setting PG_DAILY_AT)"
-        read -rp "Choose: " sched
+        read -rp "Choose: " sched || menu_eof
         case "$sched" in
           a) value=1; unit=days;;
           b) value=1; unit=midnight;;
@@ -821,13 +837,14 @@ pick_duration() {  # pick_duration <path> <pattern>
     esac
     if [ -z "${value:-}" ]; then
       if [ "$unit" = "mb" ]; then
-        read -rp "Rotate when the file exceeds how many MB: " value
+        read -rp "Rotate when the file exceeds how many MB: " value || menu_eof
       else
-        read -rp "Enter number of ${unit}: " value
+        read -rp "Enter number of ${unit}: " value || menu_eof
       fi
       if ! is_positive_int "$value"; then
         echo "${C_RED}Please enter a whole number 1 or greater.${C_RESET}"; value=""; continue
       fi
+      value=$(( 10#$value ))
     fi
 
     if [ "$unit" = "mb" ]; then
@@ -918,7 +935,7 @@ add_path() {
     echo "  ${C_CYAN}1${C_RESET}) A specific file path (e.g. /var/log/app.log)"
     echo "  ${C_CYAN}2${C_RESET}) A directory          (e.g. /var/log/myapp)"
     echo "  ${C_CYAN}0${C_RESET}) Cancel"
-    read -rp "Choose: " type_choice
+    read -rp "Choose: " type_choice || menu_eof
     case "$type_choice" in
       1)
         pattern=$(basename "$target")
@@ -1054,7 +1071,7 @@ run_purge_now() {
   dashboard
   echo
   echo "${C_BOLD}Manual purge${C_RESET} — ${C_YELLOW}immediately${C_RESET} purges all enabled paths, ignoring schedule."
-  echo "${C_DIM}Each file is rotated only when it is safe for its readers/writers; the old copy is kept for the hold period (default 24h), then deleted. Unsafe files are skipped.${C_RESET}"
+  echo "${C_DIM}Each file is rotated only when it is safe for its readers/writers; the old copy is kept for the hold period (default $(human_secs "$PG_GRACE_SEC")), then deleted. Unsafe files are skipped.${C_RESET}"
   if confirm "Force-purge all enabled paths right now?"; then
     echo
     PG_LOCK_WAIT=900 with_lock do_worker "verbose" "force"
@@ -1213,9 +1230,9 @@ backup_configuration() {  # backup_configuration [dest_file]
   [ -z "$dest" ] && dest="${BACKUP_DIR}/purging-config-$(date +%Y%m%d-%H%M%S).tar.gz"
   if [ ! -d "$CONF_DIR" ]; then echo "error: nothing to back up — $CONF_DIR does not exist" >&2; return 1; fi
   # only the configuration: not earlier backups (each backup would contain all the previous ones and double
-  # in size), not lock or temp files
+  # in size), not lock or temp files, not broken configs set aside by Health Check (quarantine/)
   local b; b=$(basename "$CONF_DIR")
-  if tar -czf "$dest" -C "$(dirname "$CONF_DIR")" --exclude="$b/backups" --exclude="$b/.*.lock" --exclude="$b/*.tmp.*" \
+  if tar -czf "$dest" -C "$(dirname "$CONF_DIR")" --exclude="$b/backups" --exclude="$b/quarantine" --exclude="$b/.*.lock" --exclude="$b/*.tmp.*" \
        --exclude="$b/paths.d/.*" "$b" 2>/dev/null; then
     chmod 600 "$dest" 2>/dev/null
     echo "Backup written to: $dest"
@@ -1238,15 +1255,20 @@ restore_configuration() {  # restore_configuration <archive>
   # Only a backup made by this tool is accepted: nothing in it may land outside the config folder. It is
   # unpacked into a temporary folder first and every path config is checked before anything is replaced.
   b=$(basename "$CONF_DIR")
-  bad=$(tar -tzf "$src" 2>/dev/null | grep -vE "^(\./)?${b}/?\$|^(\./)?${b}/(engine\.conf|\.installed|\.[a-z]+\.lock|paths\.d/?|paths\.d/[0-9A-Za-z_.-]+\.conf|backups(/.*)?)\$" | head -1)
+  bad=$(tar -tzf "$src" 2>/dev/null | grep -vE "^(\./)?${b}/?\$|^(\./)?${b}/(engine\.conf|\.installed|\.[a-z]+\.lock|paths\.d/?|paths\.d/[0-9A-Za-z_.-]+\.conf|backups(/.*)?|quarantine(/.*)?)\$" | head -1)
   [ -z "$bad" ] || { echo "error: '$src' is not a backup of this tool (unexpected entry: $bad) — nothing restored" >&2; return 1; }
   tmp=$(mktemp -d) || { echo "error: cannot create a temporary folder" >&2; return 1; }
-  if ! tar -xzf "$src" -C "$tmp" --no-same-owner --exclude="$b/backups" 2>/dev/null \
+  # (backups made before v2.6.11 may hold quarantine/ — accepted above, never unpacked)
+  if ! tar -xzf "$src" -C "$tmp" --no-same-owner --exclude="$b/backups" --exclude="$b/quarantine" 2>/dev/null \
      || [ -n "$(find "$tmp" ! -type f ! -type d 2>/dev/null | head -1)" ]; then
     rm -rf "$tmp"; echo "error: '$src' could not be unpacked safely — nothing restored" >&2; return 1
   fi
   local safety; safety="${BACKUP_DIR}/pre-restore-$(date +%Y%m%d-%H%M%S).tar.gz"
-  backup_configuration "$safety" >/dev/null 2>&1
+  # the current paths are deleted below: never without a safety copy of them
+  if [ -d "$CONF_DIR" ] && ! backup_configuration "$safety" >/dev/null 2>&1; then
+    rm -rf "$tmp"; rm -f "$safety"
+    echo "error: could not save a safety backup of the current configuration (disk full?) — nothing restored" >&2; return 1
+  fi
   _restore_apply() {
     local c
     for c in "$PATHS_DIR"/*.conf; do [ -e "$c" ] && rm -f "$c"; done    # paths added after the backup go too
@@ -1264,7 +1286,12 @@ restore_configuration() {  # restore_configuration <archive>
       rm -f "$SETTINGS_FILE"                                           # the backup had only default settings
     fi
   }
-  with_conf_lock _restore_apply
+  if ! with_conf_lock _restore_apply; then
+    rm -rf "$tmp"; settings_load
+    echo "error: the restore did not complete — the current configuration was saved first to: $safety" >&2
+    log_error "restore from $src did not complete (safety backup: $safety)"
+    return 1
+  fi
   rm -rf "$tmp"
   settings_load
   echo "Restored configuration from: $src  (${n} path(s)$([ "$skipped" -gt 0 ] && echo ", ${skipped} skipped"))"
@@ -1376,6 +1403,9 @@ Type=simple
 ExecStart=${SELF_INSTALL_PATH} --watch
 Restart=always
 RestartSec=5
+# a stop goes to the watcher only: it finishes the file in hand (never stops between a move and the reload)
+KillMode=mixed
+TimeoutStopSec=120
 
 [Install]
 WantedBy=multi-user.target
@@ -1476,14 +1506,8 @@ det_glob_match() {
 # det_proc_users <file> — one line per process holding the file open:
 #   pid|comm|kind|rw|append|pos     rw: r|w|rw   append: 1|0   kind: rsyslog|fluentd|wazuh|other
 det_proc_users() {
-  local real fd pid n flags pos comm cmd acc app kind rw esc
+  local real fd pid n flags pos comm cmd acc app kind rw
   real=$(readlink -f "$1" 2>/dev/null) || return 0
-  # find -lname takes a glob: a file named like sshd[123].log must be matched literally
-  local _i _ch; esc=""                                  # no fork: called often
-  for (( _i=0; _i<${#real}; _i++ )); do
-    _ch=${real:_i:1}
-    case "$_ch" in '['|'*'|'?'|'\') esc+="\\$_ch";; *) esc+="$_ch";; esac
-  done
   while IFS= read -r fd; do
     pid=${fd#/proc/}; pid=${pid%%/*}; n=${fd##*/}
     flags=$(awk '/^flags:/{print $2}' "/proc/$pid/fdinfo/$n" 2>/dev/null)
@@ -1501,11 +1525,57 @@ det_proc_users() {
     esac
     [ "$comm" = java ] && [[ "$cmd" == *logstash* ]] && comm=logstash      # Logstash runs as "java"
     echo "$pid|$comm|$kind|$rw|$app|${pos:-0}"
-  done < <(if [ -n "${DET_BY_INODE:-}" ] || [ "$(stat -c %h "$real" 2>/dev/null || echo 1)" -gt 1 ]; then
-             find -L /proc/[0-9]*/fd -maxdepth 1 -samefile "$real" 2>/dev/null     # same inode, any name
-           else
-             find /proc/[0-9]*/fd -maxdepth 1 -lname "$esc" 2>/dev/null
-           fi)
+  # Always by inode, never by the path text the kernel shows for the fd: a writer in a container or behind a
+  # bind mount sees the file under another path (/logs/app.log for the host's /opt/app/logs/app.log). A name
+  # match missed it, and the file was rotated under a writer that kept writing into the moved copy.
+  # (DET_BY_INODE, still set by some callers, is now always the case.)
+  # Not with find -samefile: find opens that file itself, so it showed up as a reader of every file it was
+  # asked about. Each fd's device:inode is listed instead and compared here.
+  done < <(id=$(stat -L -c '%d:%i' -- "$real" 2>/dev/null) && \
+           find -L /proc/[0-9]*/fd -mindepth 1 -maxdepth 1 -printf '%D:%i\t%p\n' 2>/dev/null | awk -F'\t' -v id="$id" '$1 == id {print $2}')
+}
+
+# det_strip_comments <c|xml> — config text on stdin without its block comments, so a disabled input or output
+# is not taken for a live one:  c = rsyslog /* … */ (outside quotes; $Directive lines are left alone — their
+# paths contain /* as in $IncludeConfig /etc/rsyslog.d/*.conf),  xml = Wazuh <!-- … -->. Comments may span lines.
+det_strip_comments() {
+  awk -v mode="$1" '
+    {
+      line = $0; out = ""; q = ""
+      if (!inc && mode == "c" && line ~ /^[ \t]*\$/) { print line; next }
+      while (length(line) > 0) {
+        if (inc) {
+          e = index(line, endm)
+          if (e == 0) { line = ""; break }
+          line = substr(line, e + length(endm)); inc = 0; continue
+        }
+        if (mode == "xml") {
+          s = index(line, "<!--")
+          if (s == 0) { out = out line; break }
+          out = out substr(line, 1, s - 1); line = substr(line, s + 4); inc = 1; endm = "-->"; continue
+        }
+        c = substr(line, 1, 1)
+        if (q != "") {
+          if (c == "\\") { out = out substr(line, 1, 2); line = substr(line, 3); continue }
+          out = out c; if (c == q) q = ""; line = substr(line, 2); continue
+        }
+        if (c == "\"" || c == "\047") { q = c; out = out c; line = substr(line, 2); continue }
+        if (substr(line, 1, 2) == "/*") { inc = 1; endm = "*/"; line = substr(line, 3); continue }
+        out = out c; line = substr(line, 2)
+      }
+      print out
+    }'
+}
+
+# det_expand_dates <pattern> — a reader path with date codes (fluentd %Y-%m-%d, Wazuh %Y/%b/%d) names only
+# the current file, not every day's: today's and yesterday's names (yesterday's may still be read to its end).
+# A pattern without date codes is printed as it is.
+det_expand_dates() {
+  if [[ "$1" == *%[A-Za-z]* ]]; then
+    { LC_ALL=C date +"$1"; LC_ALL=C date -d '1 day ago' +"$1"; } 2>/dev/null | awk '!seen[$0]++'
+  else
+    printf '%s\n' "$1"
+  fi
 }
 
 # det_rsyslog_inputs — "pattern|on|off" per imfile input (on = reopenOnTruncate="on").
@@ -1517,7 +1587,7 @@ det_rsyslog_inputs() {
 det_rsyslog_inputs_raw() {
   local f blk pat re rsf
   mapfile -t rsf < <(list_glob DET_RSYSLOG_FILES)
-  for f in ${rsf[@]+"${rsf[@]}"}; do [ -r "$f" ] && grep -vE '^[[:space:]]*#' "$f"; done 2>/dev/null | tr '\n' ' ' \
+  for f in ${rsf[@]+"${rsf[@]}"}; do [ -r "$f" ] && grep -vE '^[[:space:]]*#' "$f"; done 2>/dev/null | det_strip_comments c | tr '\n' ' ' \
     | grep -oiE 'input[[:space:]]*\([^)]*type[[:space:]]*=[[:space:]]*"imfile"[^)]*\)' | while IFS= read -r blk; do
         # the File= parameter itself — not stateFile= or any other name ending in "file"; spaces around = allowed
         pat=$(sed -nE 's/.*(^|[^A-Za-z])[Ff][Ii][Ll][Ee][[:space:]]*=[[:space:]]*"([^"]+)".*/\2/p' <<<"$blk")
@@ -1544,7 +1614,7 @@ det_rsyslog_outputs_raw() {
   local -a rsf=()
   declare -A tpl=()
   mapfile -t rsf < <(list_glob DET_RSYSLOG_FILES)
-  all=$(for f in ${rsf[@]+"${rsf[@]}"}; do [ -r "$f" ] && grep -vE '^[[:space:]]*#' "$f"; done 2>/dev/null)
+  all=$(for f in ${rsf[@]+"${rsf[@]}"}; do [ -r "$f" ] && grep -vE '^[[:space:]]*#' "$f"; done 2>/dev/null | det_strip_comments c)
   [ -n "$all" ] || return 0
   # templates: template(name="T" type="string" string="…")  and  $template T,"…"
   while IFS= read -r blk; do
@@ -1562,6 +1632,7 @@ det_rsyslog_outputs_raw() {
     if [ -z "$s" ]; then
       t=$(sed -nE 's/.*(^|[^A-Za-z.])[Dd][Yy][Nn][Aa][Ff][Ii][Ll][Ee][[:space:]]*=[[:space:]]*"([^"]+)".*/\2/p' <<<"$blk")
       [ -n "$t" ] && s=${tpl[$t]:-}
+      det_rs_dated_tpl "$s" && continue
     fi
     [[ "$s" == /* ]] && sed -E 's/%[^%]*%/*/g' <<<"$s"
   done < <(tr '\n' ' ' <<<"$all" | grep -oiE 'action[[:space:]]*\([^)]*type[[:space:]]*=[[:space:]]*"omfile"[^)]*\)')
@@ -1570,10 +1641,19 @@ det_rsyslog_outputs_raw() {
   while IFS= read -r s; do
     case "$s" in
       /*) printf '%s\n' "$s";;
-      \?*) t=${s#\?}; [[ "${tpl[$t]:-}" == /* ]] && sed -E 's/%[^%]*%/*/g' <<<"${tpl[$t]}";;
+      \?*) t=${s#\?}; [[ "${tpl[$t]:-}" == /* ]] && ! det_rs_dated_tpl "${tpl[$t]}" && sed -E 's/%[^%]*%/*/g' <<<"${tpl[$t]}";;
     esac
   done < <(awk '$0 !~ /^[ \t]*\$/ && $0 !~ /[()]/ && NF >= 2 { w=$NF; sub(/;.*/, "", w); sub(/^-\//, "/", w); if (w ~ /^\// || w ~ /^\?[A-Za-z0-9_.-]+$/) print w }' <<<"$all")
   return 0
+}
+
+# det_rs_dated_tpl <template string> — 0 if the file name comes partly from the date (%$year%, %$day%,
+# %timegenerated:…%, %$now% …). Such a template names a new file (or folder: /remote/%$year%/%$month%/%$day%/
+# syslog.log) every day; as a wildcard it would also claim every older day's file as written by rsyslog, so
+# each old file was rotated (one rsyslog reload per file) instead of being left to expire. Not counted.
+det_rs_dated_tpl() {
+  local s="${1,,}"
+  [[ "$s" =~ %[^%]*(year|month|day|hour|minute|qhour|hhour|now|timegenerated|timereported|date)[^%]*% ]]
 }
 
 # det_rsyslog_running — "1" if an rsyslogd process is running
@@ -1585,16 +1665,17 @@ det_rsyslog_running() {
 # det_rsyslog_writes <file> — 0 if a running rsyslog writes this file according to its config.
 # A template name (glob) does not count for a date-named file: /var/log/fw-%$day%.log names today's file AND
 # every older day's, and only today's is still written.
+# Sets DET_RS_HOW: exact (the config names this very path) or glob (a template / wildcard matches it).
 det_rsyslog_writes() {
   local f="$1" p outs run
+  DET_RS_HOW=""
   if [ -n "${DET_FL_AT:-}" ]; then outs=$DET_RS_OUT; run=$DET_RS_RUN; else outs=$(det_rsyslog_outputs_raw); run=$(det_rsyslog_running); fi
   [ "$run" = 1 ] && [ -n "$outs" ] || return 1
+  grep -qxF -- "$f" <<<"$outs" && { DET_RS_HOW=exact; return 0; }
   while IFS= read -r p; do
-    [ -n "$p" ] || continue
-    if [[ "$p" == *[*?]* ]]; then
-      pg_dated_name "${f##*/}" && continue
-      det_glob_match "$f" "$p" && return 0
-    elif [ "$f" = "$p" ]; then return 0; fi
+    [[ "$p" == *[*?]* ]] || continue
+    pg_dated_name "${f##*/}" && continue
+    det_glob_match "$f" "$p" && { DET_RS_HOW=glob; return 0; }
   done <<<"$outs"
   return 1
 }
@@ -1654,11 +1735,15 @@ det_fluentd_sources_raw() {
       function val(s,  k) { sub(/^[ \t]*[a-z_]+[ \t]+/,"",s); sub(/[ \t]+#.*/,"",s); sub(/[ \t]+$/,"",s); gsub(/"/,"",s); gsub(/\047/,"",s); return s }
       /<source>/                       { ins=1; t=0; p=""; pf=""; ex=""; next }
       ins && /@type[ \t]+"?tail"?/     { t=1 }
-      ins && /^[ \t]*path[ \t]/        { p=val($0); gsub(/%[A-Za-z]/,"*",p) }
+      ins && /^[ \t]*path[ \t]/        { p=val($0) }
       ins && /^[ \t]*pos_file[ \t]/    { pf=val($0) }
       ins && /^[ \t]*exclude_path[ \t]/ { ex=val($0); gsub(/[\[\] ]/,"",ex) }
       /<\/source>/                     { if (ins && t) print p "|" pf "|" ex; ins=0 }
     ' "$c" 2>/dev/null
+  done | while IFS='|' read -r p pf ex; do
+    # date codes (path /var/log/app/%Y-%m-%d.log): today's and yesterday's file, not every day's
+    if [[ "$p" == *%[A-Za-z]* ]]; then det_expand_dates "$p" | while IFS= read -r one; do printf '%s|%s|%s\n' "$one" "$pf" "$ex"; done
+    else printf '%s|%s|%s\n' "$p" "$pf" "$ex"; fi
   done | sort -u
 }
 
@@ -1731,7 +1816,9 @@ pg_protected_file() {
 # det_wazuh_patterns — <location> entries of ossec.conf (strftime %x -> *)
 det_wazuh_patterns() {
   [ -r "$DET_WAZUH_CONF" ] || return 0
-  grep -oE '<location>[^<]+</location>' "$DET_WAZUH_CONF" | sed -E 's#</?location>##g; s/%[A-Za-z]/*/g'
+  local p
+  det_strip_comments xml < "$DET_WAZUH_CONF" | grep -oE '<location>[^<]+</location>' | sed -E 's#</?location>##g' \
+    | while IFS= read -r p; do det_expand_dates "$p"; done
 }
 
 # det_wazuh_offset <file> — logcollector's stored read offset (empty if unknown)
@@ -2053,7 +2140,11 @@ with_lock() {
 do_watch() {
   log_info "realtime watcher started (purge pass every $(human_secs "$PG_PASS_SEC"), rotated-copy readers checked every $(human_secs "$PG_TICK_SEC"))"
   local _hb=0 _last=-999999 _beat=$SECONDS
-  trap 'log_info "realtime watcher stopping"; exit 0' TERM INT
+  # A stop (systemctl stop/restart, Ctrl-C) only sets PG_STOP: exiting at once could land between moving a
+  # live file and telling its writer to reopen. The current file is finished, the rest of the pass is left
+  # for the next start (see purge_one_path), then the watcher exits.
+  PG_STOP=""
+  trap 'PG_STOP=1' TERM INT
   while true; do
     settings_reload_if_changed
     if [ $(( SECONDS - _last )) -ge "$PG_PASS_SEC" ]; then
@@ -2064,8 +2155,22 @@ do_watch() {
       PG_LOCK_QUIET=1 with_lock pg_watch_all
     fi
     if [ $(( SECONDS - _beat )) -ge 3600 ]; then _beat=$SECONDS; log_info "watcher alive — ${_hb} purge passes so far"; fi
-    sleep "$PG_TICK_SEC"
+    [ -n "$PG_STOP" ] || pg_auto_update_tick
+    [ -n "$PG_STOP" ] && break
+    sleep "$PG_TICK_SEC" & wait $! 2>/dev/null    # wait (not a plain sleep) lets a stop interrupt the pause
+    [ -n "$PG_STOP" ] && break
   done
+  log_info "realtime watcher stopping"
+  exit 0
+}
+
+# pg_noterm <command...> — run it with TERM/INT ignored (children inherit that), so a service stop cannot
+# cut it short half-way. The stop itself still reaches the watcher, which acts on it afterwards.
+pg_noterm() { ( trap '' TERM INT; "$@" ); }
+# pg_recreate <file> <mode> <uid> <gid> — the empty live file again, right after a rotation
+pg_recreate() {
+  if ( set -C; : > "$1" ) 2>/dev/null; then chmod "$2" "$1" 2>/dev/null; chown "$3:$4" "$1" 2>/dev/null; fi
+  return 0
 }
 
 # ============================================================
@@ -2544,8 +2649,23 @@ pg_copy_info() {
     while IFS='=' read -r k v; do case "$k" in COPY) c=$v;; DELETE_AT) due=$v;; esac; done < "$rec"
     if [ "$c" = "$f" ] && [[ "$due" =~ ^[0-9]+$ ]]; then PG_COPY_DUE=$due; PG_COPY_REC=$rec; return 0; fi
   fi
-  if pg_in_copy_dir "$f"; then PG_COPY_DUE=$(( mt + hold )); return 0; fi
+  # Without a record only a file named like our copies counts: any other file that happens to sit in a
+  # root-owned folder called "purged" (an application's own data, /opt/app/data/purged/db.bak) is not ours.
+  if pg_in_copy_dir "$f" && pg_copy_name_like "${f##*/}"; then PG_COPY_DUE=$(( mt + hold )); return 0; fi
   return 1
+}
+
+# pg_copy_name_like <name> — 0 if the name has the shape of PG_COPY_NAME (any log name, any date), e.g.
+# *_delete-at_*-*-*_at_*-*-*-*-** for the default
+PG_CN_SRC=""; PG_CN_GLOB=""
+pg_copy_name_like() {
+  if [ "$PG_CN_SRC" != "$PG_COPY_NAME" ] || [ -z "$PG_CN_GLOB" ]; then
+    # {name}, {ext} and every date code (%d, %-d, %_H …) -> *, the rest literal (glob characters escaped)
+    PG_CN_GLOB=$(printf '%s' "$PG_COPY_NAME" | sed -E 's/\{name\}|\{ext\}/\x02/g; s/%%/\x01/g; s/%[-_0^#]*[0-9]*[A-Za-z]/\x02/g; s/[][?*\\]/\\&/g; s/\x01/%/g; s/\x02+/*/g')
+    PG_CN_SRC=$PG_COPY_NAME
+  fi
+  # shellcheck disable=SC2053
+  [[ "$1" == $PG_CN_GLOB ]]
 }
 
 # pg_copy_dir_ready <folder> <live file> — 0 if copies of that file can go into the folder (made if missing).
@@ -2721,11 +2841,14 @@ pg_do_rotate() {
     crec="$PG_COPIES_DIR/$key.copy"
     pg_copy_record "$dest" "$f" "$due" "$key" || { rm -f "$(pg_watch_rec "$dest")"; PG_WHY="cannot write copy record in $PG_COPIES_DIR — not rotating"; return 2; }
   fi
-  pg_move_copy "$f" "$dest" || { rm -f "$(pg_watch_rec "$dest")" ${crec:+"$crec"}; PG_WHY="could not move $f to $dest"; return 1; }
+  # From the move to the reload nothing may be cut short. A service stop or restart (systemd sends TERM to
+  # every process of the service) used to kill the reload command right after the move, leaving the writer
+  # on the moved copy and no live file. These steps run with TERM ignored; the stop is acted on after them.
+  pg_noterm pg_move_copy "$f" "$dest" || { rm -f "$(pg_watch_rec "$dest")" ${crec:+"$crec"}; PG_WHY="could not move $f to $dest"; return 1; }
   # recreate immediately so the file never stays missing, keeping its original permissions
-  if ( set -C; : > "$f" ) 2>/dev/null; then chmod "$mode" "$f" 2>/dev/null; chown "$uid:$gid" "$f" 2>/dev/null; fi
+  pg_noterm pg_recreate "$f" "$mode" "$uid" "$gid"
   for c in ${PG_RELOAD_CMDS[@]+"${PG_RELOAD_CMDS[@]}"}; do
-    $c >/dev/null 2>&1 || log_warn "reload command failed: $c"
+    pg_noterm $c >/dev/null 2>&1 || log_warn "reload command failed: $c"
   done
   # t counts 0.2s steps. Readers often finish the old copy within a second of the rotation, so its
   # watch record is sampled at this finer step here (fewer lines replayed twice when one closes fast).
@@ -2793,11 +2916,27 @@ pg_process_file() {
   sz=${sz:-0}; base="${f##*/}"; now=$(date +%s)
   mins=$(unit_to_min "$RETENTION_VALUE" "$RETENTION_UNIT")
   if [ -n "$smt" ] && pg_copy_info "$f" "$hold" "$sdev $sino $smt"; then old=1; cdue=$PG_COPY_DUE; crec=$PG_COPY_REC; else pg_old_name "$base" && old=1; fi
-  # In size / daily mode a date-named file (firewall_20261120.log) that a process still writes is today's live
-  # file, not a finished one: without this it was never rotated and its size limit never applied.
-  if [ "$old" = 1 ] && [ -z "$cdue" ] && [ "$RETENTION_UNIT" = "mb" -o "$RETENTION_UNIT" = "midnight" ] \
-     && ! pg_rotated_name "$base" && pg_dated_name "$base"; then
-    pg_writers_check "$f"; [ "$PG_WRITERS" -gt 0 ] && old=0
+  # A name that looks finished can still be the live file a writer is on right now:
+  #  - size / daily mode: a date-named file (firewall_20261120.log, fw-20261124) is today's file — without this
+  #    it was never rotated and its size limit never applied (in time mode it is finished once its day is over)
+  #  - any mode: a name ending in .<digits> that is no date, e.g. 192.168.1.10 (rsyslog's one-file-per-sender
+  #    template %FROMHOST-IP%) — it was taken for a rotated app.log.1 and never rotated, so it grew forever
+  # It counts as live only while a writer has it open, or rsyslog's config writes it. For a .<digits> name a
+  # wildcard rsyslog template (/var/log/%programname% -> /var/log/*) would also match logrotate's syslog.1, so
+  # there it must also have been written in the last PG_RECENT_WRITE_SEC. Compressed, .old/.sum names and
+  # .purge- copies are always finished.
+  if [ "$old" = 1 ] && [ -z "$cdue" ] && ! [[ "$base" =~ \.(gz|xz|bz2|zst|old|sum)$|\.purge-[0-9]+$ ]]; then
+    local maybe_live=0
+    if pg_dated_name "$base"; then
+      if [ "$RETENTION_UNIT" = "mb" ] || [ "$RETENTION_UNIT" = "midnight" ]; then maybe_live=1; fi
+    elif [[ "$base" =~ \.[0-9]+$ ]]; then
+      maybe_live=2
+    fi
+    if [ "$maybe_live" != 0 ]; then
+      pg_writers_check "$f"
+      if [ "$PG_WRITERS" -gt 0 ] && { [ "$maybe_live" = 1 ] || [ -z "$PG_WRITER_CONF" ] || [ "${DET_RS_HOW:-}" = exact ] \
+           || [ $(( now - ${smt:-0} )) -lt "$PG_RECENT_WRITE_SEC" ]; }; then old=0; fi
+    fi
   fi
   if [ "$force" != "force" ] && [ "${PG_NEXT_TRY[$f]:-0}" -gt "$now" ]; then
     PG_OUTCOME="skipped"
@@ -3041,6 +3180,11 @@ purge_one_path() {
     elif [ -n "${pend[$file]:-}" ]; then
       file_due=1                                    # deferred earlier: still due until it is handled
     fi
+    if [ -n "${PG_STOP:-}" ]; then
+      # the service is stopping: due live files not reached yet are retried first thing at the next start
+      [ "$file_due" = 1 ] && [[ "$file" != */"$PG_COPY_DIR"/* ]] && ! pg_old_name "${file##*/}" && pend_new[$file]=1
+      continue
+    fi
     pg_process_file "$file" "$file_due" "$dry" "$verbose" "$force"
     freed=$(( freed + PG_FREED ))
     [ "$PG_OUTCOME" = "acted" ] && acted=$(( acted + 1 ))
@@ -3132,7 +3276,7 @@ settings_edit() {
       [ "$i" = 0 ] && echo "   ${C_DIM}(empty)${C_RESET}"
       echo
       menu_row "a" "Add an item"; menu_row "d" "Delete an item"; menu_row "r" "Reset to default"; menu_row "0" "Back"
-      read -rp "Choose: " ans
+      read -rp "Choose: " ans || menu_eof
       case "$ans" in
         a|A) read -rp "New item: " item; [ -n "$item" ] || continue
              settings_reload_if_changed          # add to the list as it is on disk now, not as it was shown
@@ -3142,6 +3286,7 @@ settings_edit() {
              if [ "$(stat -c '%y %i' "$SETTINGS_FILE" 2>/dev/null)" != "$SETTINGS_MTIME" ]; then
                settings_load; error_msg "The settings were changed elsewhere meanwhile — check the list again."; pause; continue
              fi
+             [[ "$ans" =~ ^[0-9]{1,6}$ ]] && ans=$(( 10#$ans ))
              if [[ "$ans" =~ ^[0-9]+$ ]] && [ -n "${items[$ans]:-}" ]; then
                local keep="" j; for (( j=1; j<=i; j++ )); do [ "$j" = "$ans" ] || keep+="${keep:+|}${items[$j]}"; done
                if [ -z "$keep" ] && [ -n "$def" ]; then
@@ -3197,6 +3342,7 @@ settings_menu() {
     echo
     read -rp "Change which setting (number): " n
     case "$n" in ""|0) return;; esac
+    [[ "$n" =~ ^[0-9]{1,6}$ ]] && n=$(( 10#$n ))
     if [[ "$n" =~ ^[0-9]+$ ]] && [ -n "${keys[$n]:-}" ]; then settings_edit "${keys[$n]}"; else echo "${C_RED}Invalid choice.${C_RESET}"; sleep 1; fi
   done
 }
@@ -3256,7 +3402,7 @@ main_menu() {
     menu_section ""
     menu_row "0" "Exit"
     echo
-    read -rp "Select an option: " opt
+    read -rp "Select an option: " opt || menu_eof
     case "$opt" in
       1) ;;                       # loop re-renders dashboard
       2) add_path;;
@@ -3369,6 +3515,8 @@ path_plan() {
   [ "$PG_COPY_DIR" != off ] && pprune=( -mindepth 1 \( -type d -name "$PG_COPY_DIR" -prune \) -o )
   while IFS= read -r -d '' f; do
     [ -e "$f" ] || continue          # removed while the plan was being built (e.g. by the running service)
+    # a file in a copy folder that is not one of our copies is never touched by the engine: not listed
+    if pg_in_copy_dir "$f" && ! pg_copy_info "$f" "${HOLD_SEC:-$PG_GRACE_SEC}"; then continue; fi
     total=$(( total + 1 ))
     [ "$shown" -ge "$maxshow" ] && continue
     shown=$(( shown + 1 ))
@@ -3423,8 +3571,8 @@ plan_all() {
 
 # parse_duration_sec <30s|15m|2h|1d|3600> -> seconds
 parse_duration_sec() {
-  [[ "$1" =~ ^([0-9]+)(s|m|min|h|d)?$ ]] || return 1
-  local n=${BASH_REMATCH[1]}
+  [[ "$1" =~ ^([0-9]{1,9})(s|m|min|h|d)?$ ]] || return 1
+  local n=$(( 10#${BASH_REMATCH[1]} ))     # decimal: "08" must not stop the script as a bad octal number
   case "${BASH_REMATCH[2]}" in ""|s) echo "$n";; m|min) echo $(( n * 60 ));; h) echo $(( n * 3600 ));; d) echo $(( n * 86400 ));; esac
 }
 
@@ -3598,9 +3746,112 @@ Options:
   --repair            Quarantine corrupted configs and reset permissions
   --debug             Enable debug-level logging for this invocation
   --verbose           Enable verbose console output for this invocation
+  --update            Install the newest version, if there is one (asks first; --yes: no question)
+  --update --check    Only tell whether a newer version exists, and what changed
+                      (automatic, once a day:  --set PG_AUTO_UPDATE on   [time: PG_AUTO_UPDATE_AT, default 03:00])
   --version           Print version information
   --help              Show this help text
 EOF
+}
+
+# ============================================================
+# SECTION: Update — one command to move to the newest version
+# ============================================================
+# The newest version is the purging-console.sh at PG_UPDATE_URL (the releases repo's main branch only ever
+# holds released versions). It is downloaded, checked (checksum if published, bash syntax, version number),
+# and put in place the same way the installer does it: a new file renamed over the old one, so a running
+# service keeps its own copy until it is restarted on the new version.
+
+# pg_fetch <url> <out file> — 0 when downloaded (HTTP errors fail)
+pg_fetch() {
+  if command -v curl >/dev/null 2>&1; then curl -fsSL --max-time 60 -o "$2" "$1" 2>/dev/null
+  elif command -v wget >/dev/null 2>&1; then wget -q -T 60 -O "$2" "$1" 2>/dev/null
+  else echo "error: neither curl nor wget is installed" >&2; return 2; fi
+}
+
+# ver_newer <a> <b> — 0 if version a is newer than b (2.6.10 > 2.6.9)
+ver_newer() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]; }
+
+cmd_update() {
+  local check=0 yes=0 auto=0 a tmp new sum want got log
+  for a in "$@"; do
+    case "$a" in --check) check=1;; --yes|-y) yes=1;; --auto) auto=1; yes=1;; *) die "unknown option '$a' (use: --update [--check] [--yes])";; esac
+  done
+  [ "$check" = 1 ] || require_root --update "$@"
+  tmp=$(mktemp -d) || die "cannot create a temporary folder"
+  echo "Checking ${PG_UPDATE_URL} ..."
+  if ! pg_fetch "$PG_UPDATE_URL/purging-console.sh" "$tmp/pc.sh"; then
+    rm -rf "$tmp"; echo "error: could not download $PG_UPDATE_URL/purging-console.sh (no internet / proxy / wrong PG_UPDATE_URL?)" >&2
+    [ "$auto" = 1 ] && log_warn "auto-update: could not download $PG_UPDATE_URL/purging-console.sh — tried again tomorrow"
+    return 1
+  fi
+  new=$(sed -nE 's/^readonly APP_VERSION="([0-9][0-9.]*)"$/\1/p' "$tmp/pc.sh" | head -1)
+  if [ -z "$new" ] || ! grep -q '^readonly APP_NAME="Purging Management Console"' "$tmp/pc.sh"; then
+    rm -rf "$tmp"; echo "error: the downloaded file is not this tool — nothing changed" >&2
+    [ "$auto" = 1 ] && log_warn "auto-update: $PG_UPDATE_URL/purging-console.sh is not this tool — nothing changed"
+    return 1
+  fi
+  if ! ver_newer "$new" "$APP_VERSION"; then
+    rm -rf "$tmp"; echo "Up to date: v${APP_VERSION} is the newest version (newest published: v${new})."; return 0
+  fi
+  echo "${C_BOLD}New version available: v${new}${C_RESET}  (installed: v${APP_VERSION})"
+  # what changed since the installed version (CHANGELOG sections newer than it)
+  if pg_fetch "$PG_UPDATE_URL/CHANGELOG.md" "$tmp/CHANGELOG.md"; then
+    log=$(awk -v cur="$APP_VERSION" '
+      function newer(a, b,  x, y, n, m, i) { n = split(a, x, "."); m = split(b, y, ".")
+        for (i = 1; i <= (n > m ? n : m); i++) { if ((x[i] + 0) > (y[i] + 0)) return 1; if ((x[i] + 0) < (y[i] + 0)) return 0 }
+        return 0 }
+      /^## v[0-9]/ { v = $2; sub(/^v/, "", v); show = newer(v, cur) }
+      show' "$tmp/CHANGELOG.md")
+    [ -n "$log" ] && { echo; echo "What changed:"; sed 's/^/  /' <<<"$log"; echo; }
+  fi
+  if [ "$check" = 1 ]; then rm -rf "$tmp"; echo "Install it with: purgingconsole --update"; return 0; fi
+  # checksum, when the release publishes one (catches a cut-off download)
+  if pg_fetch "$PG_UPDATE_URL/purging-console.sh.sha256" "$tmp/sum"; then
+    want=$(awk '{print $1; exit}' "$tmp/sum"); got=$(sha256sum "$tmp/pc.sh" | awk '{print $1}')
+    if [ "$want" != "$got" ]; then
+      rm -rf "$tmp"; echo "error: checksum does not match (download damaged?) — nothing changed" >&2
+      [ "$auto" = 1 ] && log_warn "auto-update: v$new download does not match its checksum — nothing changed"
+      return 1
+    fi
+  fi
+  if ! bash -n "$tmp/pc.sh" 2>/dev/null; then
+    rm -rf "$tmp"; echo "error: the downloaded file does not parse — nothing changed" >&2
+    [ "$auto" = 1 ] && log_warn "auto-update: v$new does not parse — nothing changed"
+    return 1
+  fi
+  if [ "$yes" != 1 ]; then
+    confirm "Install v${new} now?" || { rm -rf "$tmp"; echo "Not installed."; return 0; }
+  fi
+  local dst="${SELF_INSTALL_PATH}.new.$$"
+  if ! { cp "$tmp/pc.sh" "$dst" && chmod 755 "$dst" && mv -f "$dst" "$SELF_INSTALL_PATH"; }; then
+    rm -f "$dst"; rm -rf "$tmp"; echo "error: could not write $SELF_INSTALL_PATH — nothing changed" >&2; return 1
+  fi
+  rm -rf "$tmp"
+  log_success "$([ "$auto" = 1 ] && echo "auto-update: ")updated from v${APP_VERSION} to v${new} (${PG_UPDATE_URL})"
+  echo "Installed: $("$SELF_INSTALL_PATH" --version)"
+  if systemctl is-active --quiet "${SERVICE_NAME}.service" 2>/dev/null; then
+    if [ "$auto" = 1 ]; then
+      # called from the service itself: queue the restart and return — the watcher then gets the stop, finishes
+      # the file in hand and exits, and systemd starts it again on the new version
+      systemctl --no-block restart "${SERVICE_NAME}.service"
+    else
+      systemctl restart "${SERVICE_NAME}.service" && echo "The running purge service was restarted on the new version."
+    fi
+  fi
+  return 0
+}
+
+# pg_auto_update_tick — from the watcher loop: once a day at PG_AUTO_UPDATE_AT, when PG_AUTO_UPDATE is on
+PG_UPDATE_STAMP="/var/lib/purging-console/last-update-check"
+pg_auto_update_tick() {
+  [ "$PG_AUTO_UPDATE" = 1 ] || return 0
+  local today; today=$(date +%F)
+  [ $(( 10#$(date +%H%M) )) -ge $(( 10#$PG_AUTO_UPDATE_AT )) ] || return 0
+  [ "$(cat "$PG_UPDATE_STAMP" 2>/dev/null)" = "$today" ] && return 0
+  mkdir -p "${PG_UPDATE_STAMP%/*}" 2>/dev/null; echo "$today" > "$PG_UPDATE_STAMP"     # once a day, even if it fails
+  ( cmd_update --auto ) >/dev/null 2>&1
+  return 0
 }
 
 main() {
@@ -3679,6 +3930,8 @@ main() {
       require_root "$@"; repair_configuration; exit 0;;
     --version)
       echo "${APP_NAME} v${APP_VERSION} (config schema v${CONFIG_SCHEMA_VERSION})"; exit 0;;
+    --update)
+      shift; cmd_update "$@"; exit $?;;
     --help|-h)
       usage; exit 0;;
     add)
@@ -3691,10 +3944,13 @@ main() {
       PG_LOCK_WAIT=900 with_lock do_worker "verbose" "force"
       success_msg "Done."
       exit 0;;
-    *)
+    "")
       require_root "$@"
       if [ ! -f "$MARKER" ]; then first_time_setup || exit 0; fi
       main_menu;;
+    *)
+      # a mistyped option (--stat, --dryrun) used to open the menu — and from cron that loops forever
+      echo "unknown option '$1' — see: purgingconsole --help" >&2; exit 2;;
   esac
 }
 
