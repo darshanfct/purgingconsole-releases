@@ -5,6 +5,12 @@ asks, installs it and restarts the service. `--update --check` only tells; `--up
 **First install, or a server still on v2.6.10 or older:** paste `install-purging-console.sh` into a root shell
 once. Check the version with `purgingconsole --version`.
 
+## v2.6.12 (2026-11-24)
+- Main menu: every option has a number now (1 to 19, 0 = Exit) instead of numbers mixed with letters.
+  Settings is 10, Service control 11. The old letters still work.
+- Retention presets and the daily schedule are chosen with numbers too.
+- Screen messages and comments use plain punctuation.
+
 ## v2.6.11 (2026-11-24)
 - **One-command update:** `purgingconsole --update` (see the top of this file). The download is checked
   (published checksum, syntax, that it is this tool and newer) before anything is replaced. Source: setting
