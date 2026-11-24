@@ -5,6 +5,12 @@ asks, installs it and restarts the service. `--update --check` only tells; `--up
 **First install, or a server still on v2.6.10 or older:** paste `install-purging-console.sh` into a root shell
 once. Check the version with `purgingconsole --version`.
 
+## v2.6.13 (2026-11-24)
+- The automatic update time is IST on every server, whatever the server's own clock: 03:00 means 03:00 IST
+  on a UTC server too. New setting `PG_AUTO_UPDATE_TZ` (default `Asia/Kolkata`; `server` = the server's clock).
+- Every automatic check now leaves a line in the log, also when nothing newer was found
+  (`auto-update: checked, v2.6.13 is the newest`).
+
 ## v2.6.12 (2026-11-24)
 - Main menu: every option has a number now (1 to 19, 0 = Exit) instead of numbers mixed with letters.
   Settings is 10, Service control 11. The old letters still work.

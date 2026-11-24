@@ -29,7 +29,7 @@ set -u
 # SECTION: Constants & Global State
 # ============================================================
 readonly APP_NAME="Purging Management Console"
-readonly APP_VERSION="2.6.12"
+readonly APP_VERSION="2.6.13"
 readonly CONFIG_SCHEMA_VERSION=2
 readonly CONF_DIR="/etc/darshan/purging"
 readonly PATHS_DIR="${CONF_DIR}/paths.d"
@@ -60,6 +60,7 @@ readonly PG_PROTECT_FLOOR=( "/" "/etc" "/usr" "/bin" "/sbin" "/lib" "/lib64" "/b
 # KEY <tab> type <tab> default <tab> group <tab> label      (list values: items separated by |)
 # types: dur (30s/15m/2h/1d)  pct  bool  size (64MB/1GB)  hhmm (23:55)  path  list:path  list:name  list:regex
 #        dirname (a folder name, or off)  copyname (copy-name format: {name} {ext} + date codes)  url (https://...)
+#        tz (a time zone like Asia/Kolkata, or server)
 SETTINGS_REGISTRY=$(cat <<'REG'
 PG_GRACE_SEC	dur	3600	Rotation	Hold each rotated copy this long, then delete it (paths can override)
 PG_DISK_EMERGENCY_PCT	pct	90	Rotation	Disk use at which a fully-read copy may go before its hold ends
@@ -97,7 +98,8 @@ PG_HELD_ROOTS	list:path	/var/log|/var/ossec/logs|/opt|/data|/srv|/home/*/*	Repor
 PG_HELD_SKIP	list:name	*/.cache/*|*/.mozilla/*|*/snap/*|*.sqlite*|*/.vscode-server/*	Reports	Paths skipped in that check
 PG_UPDATE_URL	url	https://raw.githubusercontent.com/darshanfct/purgingconsole-releases/main	Update	Where --update looks for new versions (the raw files of the releases repo: purging-console.sh, CHANGELOG.md)
 PG_AUTO_UPDATE	bool	0	Update	Install newer versions by itself once a day (off: only when you run --update)
-PG_AUTO_UPDATE_AT	hhmm	0300	Update	Time of day for the automatic update check (server time)
+PG_AUTO_UPDATE_AT	hhmm	0300	Update	Time of day for the automatic update check (in the time zone PG_AUTO_UPDATE_TZ)
+PG_AUTO_UPDATE_TZ	tz	Asia/Kolkata	Update	Time zone of PG_AUTO_UPDATE_AT: Asia/Kolkata (IST) on every server whatever its clock, or 'server' for its own clock
 REG
 )
 declare -A SETTINGS_ENV=() SETTINGS_FROM=()
@@ -132,6 +134,10 @@ settings_normalize() {
           echo "$n";;
     hhmm) [[ "$raw" =~ ^([01]?[0-9]|2[0-3]):?([0-5][0-9])$ ]] || { echo "use a time of day like 23:55"; return 1; }
           printf '%02d%02d\n' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[2]}))";;
+    tz)   [ "${raw,,}" = server ] && { echo server; return 0; }
+          [[ "$raw" =~ ^[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z0-9_+-]+)*$ ]] && { [ ! -d /usr/share/zoneinfo ] || [ -f "/usr/share/zoneinfo/$raw" ]; } \
+            || { echo "use a time zone name like Asia/Kolkata (IST), UTC, Europe/London, or server"; return 1; }
+          echo "$raw";;
     url)  [[ "$raw" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~%/+-]*)?$ ]] || { echo "use an https:// address (no spaces or quotes)"; return 1; }
           echo "${raw%/}";;
     path) [[ "$raw" = /* ]] || { echo "use an absolute path"; return 1; }
@@ -3752,7 +3758,7 @@ Options:
   --verbose           Enable verbose console output for this invocation
   --update            Install the newest version, if there is one (asks first; --yes: no question)
   --update --check    Only tell whether a newer version exists, and what changed
-                      (automatic, once a day:  --set PG_AUTO_UPDATE on   [time: PG_AUTO_UPDATE_AT, default 03:00])
+                      (automatic, once a day:  --set PG_AUTO_UPDATE on   [time: PG_AUTO_UPDATE_AT, default 03:00 IST])
   --version           Print version information
   --help              Show this help text
 EOF
@@ -3796,7 +3802,9 @@ cmd_update() {
     return 1
   fi
   if ! ver_newer "$new" "$APP_VERSION"; then
-    rm -rf "$tmp"; echo "Up to date: v${APP_VERSION} is the newest version (newest published: v${new})."; return 0
+    rm -rf "$tmp"; echo "Up to date: v${APP_VERSION} is the newest version (newest published: v${new})."
+    [ "$auto" = 1 ] && log_info "auto-update: checked, v${APP_VERSION} is the newest (published: v${new})"
+    return 0
   fi
   echo "${C_BOLD}New version available: v${new}${C_RESET}  (installed: v${APP_VERSION})"
   # what changed since the installed version (CHANGELOG sections newer than it)
@@ -3846,12 +3854,14 @@ cmd_update() {
   return 0
 }
 
-# pg_auto_update_tick - from the watcher loop: once a day at PG_AUTO_UPDATE_AT, when PG_AUTO_UPDATE is on
+# pg_auto_update_tick - from the watcher loop: once a day at PG_AUTO_UPDATE_AT (in PG_AUTO_UPDATE_TZ), when
+# PG_AUTO_UPDATE is on. A server that was off at that time checks as soon as it runs again that day.
 PG_UPDATE_STAMP="/var/lib/purging-console/last-update-check"
+pg_update_date() { if [ "$PG_AUTO_UPDATE_TZ" = server ]; then date "$@"; else TZ="$PG_AUTO_UPDATE_TZ" date "$@"; fi; }
 pg_auto_update_tick() {
   [ "$PG_AUTO_UPDATE" = 1 ] || return 0
-  local today; today=$(date +%F)
-  [ $(( 10#$(date +%H%M) )) -ge $(( 10#$PG_AUTO_UPDATE_AT )) ] || return 0
+  local today hm; today=$(pg_update_date +%F); hm=$(pg_update_date +%H%M)
+  [ $(( 10#$hm )) -ge $(( 10#$PG_AUTO_UPDATE_AT )) ] || return 0
   [ "$(cat "$PG_UPDATE_STAMP" 2>/dev/null)" = "$today" ] && return 0
   mkdir -p "${PG_UPDATE_STAMP%/*}" 2>/dev/null; echo "$today" > "$PG_UPDATE_STAMP"     # once a day, even if it fails
   ( cmd_update --auto ) >/dev/null 2>&1

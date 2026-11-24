@@ -27,7 +27,7 @@ sudo purgingconsole --update --yes    # no question (for scripts)
 
 ```bash
 sudo purgingconsole --set PG_AUTO_UPDATE on          # the service checks once a day and installs newer versions
-sudo purgingconsole --set PG_AUTO_UPDATE_AT 04:30    # when (server time; default 03:00)
+sudo purgingconsole --set PG_AUTO_UPDATE_AT 04:30    # when (IST on every server; default 03:00)
 sudo purgingconsole --set PG_AUTO_UPDATE off         # back to manual
 ```
 
