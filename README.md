@@ -1,7 +1,7 @@
 # Purging Management Console
 
 Keeps log folders from filling the disk: rotates live logs on a schedule or at a size, tells the writer
-(rsyslog, fluentd, …) to reopen, waits until every reader has finished the old copy, and deletes it after a
+(rsyslog, fluentd and others) to reopen, waits until every reader has finished the old copy, and deletes it after a
 hold time. Runs as the `purging-console` systemd service; configured with the `purgingconsole` command.
 
 ## Install (first time)
@@ -35,4 +35,4 @@ Turn it on per server. Every release pushed here then reaches that server within
 
 ## Versions
 
-Every release is a tag (`v2.6.6` … `v2.6.11`); what changed is in [CHANGELOG.md](CHANGELOG.md).
+Every release is a tag (`v2.6.6` to `v2.6.11`); what changed is in [CHANGELOG.md](CHANGELOG.md).
